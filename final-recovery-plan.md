@@ -14,7 +14,7 @@
 
 ### Out of Scope
 
-**Topics with replication factor less than 3 are assumed lost.** RF<3 topics may not have a replica in the selected region, and we make no attempt to recover them. This simplifies the entire plan: we do not analyse per-partition coverage, flag gaps, or handle missing replicas. If any RF<3 data is needed post-recovery, it must be re-created from source systems.
+**Topics with replication factor less than 3 are outside the default recovery path.** A single-region restore may not contain any surviving replica for them. The baseline plan does not attempt to auto-recover these topics. If the snapshot rewrite encounters a partition with no surviving replica on the selected region, it should fail fast and report that partition so operators can explicitly choose whether to drop/re-create it or design a separate "empty partition" recovery mode later.
 
 ---
 
@@ -73,7 +73,7 @@ The check works as follows:
 
 **This is the most dangerous aspect of the entire recovery.** If the KRaft metadata snapshot still references the original 9 broker IDs (e.g., 0-8) but our 3 recovered brokers are running as different IDs, then every single partition directory will be classified as stray and deleted within 60 seconds. Terabytes of data, gone.
 
-**This is why we keep the original broker IDs** (each recovered node runs with the same `node.id` as the original broker whose snapshot it received) **and why we rewrite the metadata snapshot** (so that `Replicas[]` only contains the 3 IDs we are actually running).
+**This is why we keep the original broker IDs** (each recovered node runs with the same `node.id` as the original broker whose snapshot it received): that is what prevents blanket stray deletion. **Rewriting the metadata snapshot serves a different purpose**: it collapses the original 9-node replica assignments down to the 3 recovered brokers so every in-scope RF=3 partition remains assigned to at least one live replica and the cluster does not start with offline partitions.
 
 ### 1.3 The `meta.properties` Identity File
 
@@ -180,7 +180,7 @@ Kafka ships first-class APIs for reading and writing snapshot files in the `kafk
 - **`BatchFileReader`** — reads any `.checkpoint` file as an iterator of record batches
 - **`BatchFileWriter`** — creates a new `.checkpoint` file with proper `SnapshotHeader`/`Footer` framing
 
-A read-modify-write tool using these APIs is approximately **100-150 lines of Java**. The processing logic for each record type is specified in Section 6, Phase 4.
+A read-modify-write tool using these APIs is approximately **100-150 lines of Java**. The processing logic for each record type is specified in Section 5, Phase 4.
 
 ### 4.5 Why Not Edit In Place?
 
@@ -300,33 +300,24 @@ cp <best_checkpoint_file> "${METADATA_DIR}/"
 
 **Why**: In a healthy cluster, all controller nodes should have nearly identical metadata snapshots. However, if one node was slightly ahead at snapshot time (more recent metadata operations committed), its snapshot will be more accurate. Using the same, most-recent snapshot on all 3 nodes ensures they start from identical cluster state, avoiding inconsistencies during quorum formation.
 
-#### 3.4 Write `server.properties`
+#### 3.4 Patch the existing broker config
 
-```bash
-cat > /path/to/server.properties << 'EOF'
-# --- Node identity ---
+Start from the broker's existing `server.properties` (or the GitOps-rendered equivalent for that node). **Do not replace it with a new minimal file.** Apply only the recovery-specific overrides below and leave all other required settings unchanged.
+
+```properties
+# Values that must be set for the recovery boot:
 node.id=<original_broker_id>
-process.roles=broker,controller
-
-# --- KRaft quorum: only the 3 recovered nodes ---
 controller.quorum.voters=A@host1:9093,B@host2:9093,C@host3:9093
-
-# --- Listeners ---
-listeners=PLAINTEXT://:9092,CONTROLLER://:9093
-inter.broker.listener.name=PLAINTEXT
-controller.listener.names=CONTROLLER
-
-# --- Storage paths (must match the original broker's layout) ---
 log.dirs=<same paths as in original snapshot>
 metadata.log.dir=<same path as in original snapshot>
-
-# --- Safety: extend stray deletion window to 24 hours ---
 file.delete.delay.ms=86400000
-
-# --- Allow unclean leader election during recovery ---
-unclean.leader.election.enable=true
-EOF
 ```
+
+Preserve from the original config:
+- `process.roles=broker,controller`
+- Listener and network settings (`listeners`, `advertised.listeners`, `listener.security.protocol.map`, `inter.broker.listener.name`, `controller.listener.names`)
+- Security/auth settings (TLS, SASL, authorizer, principal mapping, etc.)
+- `rack.id`, performance tuning, logging, and any environment-specific operational settings
 
 **Why for each notable setting:**
 
@@ -338,7 +329,9 @@ EOF
 
 - **`file.delete.delay.ms=86400000`** (24 hours): Kafka's stray detection renames partition directories to `-stray` and then permanently deletes them after this delay. The default is 60 seconds — an extremely tight window if anything goes wrong. Setting this to 24 hours gives a full day to detect and recover from any misconfiguration before data is permanently destroyed. This is the single most important safety net in the entire process.
 
-- **`unclean.leader.election.enable=true`**: After recovery, the KRaft metadata's ISR (in-sync replica) lists may reference broker IDs that are no longer running. Without unclean leader election, any partition whose entire ISR consists of missing brokers will remain offline indefinitely — no leader can be elected because no "clean" (in-ISR) candidate exists. Enabling this setting allows Kafka to elect a leader from any available replica, even if it wasn't in the ISR. This may cause minor data loss for affected partitions (the new leader may be slightly behind the old leader), which is acceptable per our constraints.
+- **Everything else should stay as-is from the source config**: The recovery boot still needs the cluster's real listener topology, security model, and operational settings. This is an overlay onto the existing config, not a fresh hand-written broker config.
+
+`unclean.leader.election.enable` should remain at its normal value (`false`) in the baseline happy path. With the snapshot rewrite collapsing each in-scope partition to a single live replica and matching ISR, unclean election should not be needed. Treat it as an emergency-only override if startup unexpectedly leaves partitions offline and you consciously accept the extra data-loss risk.
 
 #### 3.5 Verify `meta.properties`
 
@@ -379,8 +372,9 @@ if surviving is non-empty:
 if surviving is empty:
   → This means all 3 replicas of this partition were on brokers outside
     our region. For RF=3 with rack awareness, this should not happen.
-    If it does (e.g., RF<3 topic), assign to any live broker — the
-    partition comes online empty (data loss accepted per constraints).
+    If it does, abort the rewrite and report the topic-partition(s).
+    This is outside the baseline plan and indicates either an RF<3 topic,
+    a rack-placement exception, or an unexpected snapshot mismatch.
 ```
 
 **Why `leaderEpoch + 1` and `partitionEpoch + 1`**: Kafka clients and followers cache metadata including the leader epoch. Bumping these values forces them to refresh, preventing stale routing to brokers that no longer exist.
@@ -410,13 +404,14 @@ Pass through unchanged.
 
 #### Output
 
-A valid `.checkpoint` file with the same offset-epoch filename as the input (drop-in replacement). Place it on all 3 nodes:
+A valid `.checkpoint` file with the same offset-epoch filename as the input (drop-in replacement). Place it on all 3 nodes using that same basename:
 
 ```bash
+CHECKPOINT_BASENAME="$(basename <best_checkpoint_file>)"
+
 # On each node:
-cp rewritten.checkpoint "${METADATA_DIR}/"
-# Remove the original checkpoint (it has stale 9-node assignments):
-rm -f "${METADATA_DIR}/<original_checkpoint_filename>"
+cp "<rewritten_dir>/${CHECKPOINT_BASENAME}" "${METADATA_DIR}/${CHECKPOINT_BASENAME}"
+find "${METADATA_DIR}" -name "*.checkpoint" ! -name "${CHECKPOINT_BASENAME}" -delete
 ```
 
 ### Phase 5: Pre-Start Validation (do NOT skip)
@@ -452,17 +447,17 @@ done
 #    Why: Gross mismatch indicates a snapshot mount error or wrong region
 find <log.dirs> -maxdepth 1 -type d -name "*-*" | wc -l
 
-# 6. file.delete.delay.ms is set to 86400000 in server.properties
+# 6. file.delete.delay.ms is set to 86400000 in the recovery config
 #    Why: This is the safety net — if anything is wrong, you have 24 hours to stop
 #    brokers before data is permanently deleted
-grep file.delete.delay.ms /path/to/server.properties
+grep file.delete.delay.ms <recovery_server.properties>
 ```
 
 ### Phase 6: Start the Cluster
 
 ```bash
 # Start all 3 nodes simultaneously (or as close together as possible):
-kafka-server-start.sh /path/to/server.properties &
+kafka-server-start.sh <recovery_server.properties> &
 ```
 
 **What happens at startup:**
@@ -484,7 +479,10 @@ kafka-metadata-quorum.sh --bootstrap-controller host:9093 describe --status
 # Offline partitions — expect 0 (snapshot rewrite assigned all RF=3 partitions):
 kafka-topics.sh --bootstrap-server host:9092 --describe --unavailable-partitions
 
-# Under-replicated partitions — expected initially, resolves as ISR establishes:
+# Under-replicated partitions — in the steady-state recovered cluster this should
+# be empty, because the rewrite collapses each in-scope partition to RF=1 with
+# ISR matching Replicas. A brief startup transient is acceptable; a persistent
+# result means the rewrite or broker registration state is wrong.
 kafka-topics.sh --bootstrap-server host:9092 --describe --under-replicated-partitions
 
 # Watch for stray detection (should NOT happen — indicates a rewrite or meta.properties error):
@@ -506,27 +504,18 @@ grep -i "stray" <broker-logs>/*.log
 kafka-consumer-groups.sh --bootstrap-server host:9092 \
   --describe --group <group-name>
 
-# 2. Once stable, disable unclean leader election
+# 2. Reconcile recovery-only config overrides back to normal
 #
-# Why: Unclean election was needed during startup to handle stale ISR membership.
-# Once the cluster is running and ISR has re-established, it should be disabled
-# to prevent accidental data loss during normal operation.
+# Why: file.delete.delay.ms=86400000 was injected specifically for first boot.
+# Once the cluster is confirmed healthy, remove that override from the broker
+# config source/overlay and roll brokers normally. If you explicitly enabled
+# unclean leader election as an emergency override, remove that too.
 #
-kafka-configs.sh --bootstrap-server host:9092 \
-  --alter --entity-type brokers --entity-default \
-  --add-config unclean.leader.election.enable=false
+# Example target end-state in the normal config:
+#   file.delete.delay.ms=60000
+#   unclean.leader.election.enable=false
 
-# 3. Reset file.delete.delay.ms to default
-#
-# Why: The 24-hour safety window is no longer needed once the cluster is confirmed
-# healthy. Restore the default (60 seconds) so that legitimately stray partitions
-# (from future operations) are cleaned up promptly.
-#
-kafka-configs.sh --bootstrap-server host:9092 \
-  --alter --entity-type brokers --entity-default \
-  --add-config file.delete.delay.ms=60000
-
-# 4. Verify no stray directories exist
+# 3. Verify no stray directories exist
 #
 # Why: If any partition directories were renamed to -stray, it means the snapshot
 # rewrite or meta.properties was incorrect for those partitions. Investigate
@@ -549,7 +538,7 @@ The coordinator uses `hash(group.id) % num_partitions` to map each consumer grou
 
 1. **Temporary HWM lag**: Until the `__consumer_offsets` ISR establishes and the HWM catches up from the snapshot's checkpoint value, some recently committed offsets may not be visible. This self-resolves within seconds of all brokers coming online.
 
-2. **Orphaned entries**: If any user topic was RF<3 and its data was lost (per our scope declaration), offset entries for those topics still exist in `__consumer_offsets` but reference non-existent partitions. Consumers for those topics will get errors.
+2. **Out-of-scope topics**: If operators later choose to omit, drop, or re-create RF<3 topics separately, offset entries for those topics may still exist in `__consumer_offsets` and reference partitions that are no longer present. Consumers for those topics will get errors until offsets are reset or the groups are cleaned up.
 
 **Validation:**
 
@@ -592,6 +581,8 @@ Production brokers may use multiple `log.dirs` (e.g., `log.dirs=/disk1/kafka,/di
 ## 8. Replication Factor After Recovery
 
 After recovery, each partition has only the replicas that existed on the 3 selected brokers. For RF=3 topics with rack awareness, this means **RF=1 in practice** — each partition has exactly one live replica.
+
+This is an intentional metadata collapse, not an "RF=3 but two replicas are missing" situation. In the recovered steady state, `Replicas` and `ISR` should both contain that single live replica, so `--under-replicated-partitions` should normally be empty. Under-replication reappears only when you later expand replication via reassignment.
 
 **Options for expanding:**
 
@@ -655,7 +646,7 @@ Kafka transactions have well-defined recovery semantics that apply after snapsho
 - [ ] Delete all `.log`, `.checkpoint.deleted`, `.checkpoint.part` in `__cluster_metadata-0/` on all nodes
 - [ ] Delete `quorum-state` on all nodes
 - [ ] Place best `.checkpoint` on all nodes (identical copy)
-- [ ] Write `server.properties` with original broker IDs, 3-node voter set, `file.delete.delay.ms=86400000`
+- [ ] Patch the existing broker config / recovery overlay with original broker IDs, 3-node voter set, and `file.delete.delay.ms=86400000`
 
 ### Snapshot Rewrite (Phase 4)
 - [ ] Run snapshot rewrite tool with surviving broker IDs and UNASSIGNED directory mode
@@ -667,15 +658,15 @@ Kafka transactions have well-defined recovery semantics that apply after snapsho
 - [ ] Confirm no `.log` files in `__cluster_metadata-0/`
 - [ ] Confirm rewritten `.checkpoint` present on all nodes
 - [ ] Sanity-check partition directory count
-- [ ] Confirm `file.delete.delay.ms=86400000` in `server.properties`
+- [ ] Confirm `file.delete.delay.ms=86400000` in the recovery config
 
 ### After Start (Phases 6-7)
 - [ ] Quorum formed: 3 voters, 1 leader
 - [ ] 0 offline partitions
+- [ ] `--under-replicated-partitions` is empty after startup settles
 - [ ] No `-stray` directories in logs
 - [ ] Consumer group offsets validated
-- [ ] `unclean.leader.election.enable` set back to `false`
-- [ ] `file.delete.delay.ms` reset to default `60000`
+- [ ] Recovery-only config overrides removed from the normal broker config path after validation
 
 ---
 
@@ -683,7 +674,7 @@ Kafka transactions have well-defined recovery semantics that apply after snapsho
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| Stray detection deletes all partition data | **Critical** | Snapshot rewrite ensures `Replicas[]` contains live broker IDs; `file.delete.delay.ms=24h` as safety net |
+| Stray detection deletes all partition data | **Critical** | Keep original broker IDs, rewrite `Replicas[]` to match the recovered brokers, and use `file.delete.delay.ms=24h` as a safety net |
 | Topic UUID mismatch takes entire disk offline | **Critical** | Original metadata snapshot preserved → `TopicRecord` UUIDs match `partition.metadata` files; no changes to partition directories |
 | 9-node quorum deadlock prevents startup | **High** | `quorum-state` deleted; `controller.quorum.voters` set to 3 nodes; VotersRecord rewritten if dynamic quorum |
 | Consumer offset drift after recovery | **Medium** | Wait for `__consumer_offsets` HWM to stabilise before starting consumers; manual reset available |
@@ -732,7 +723,7 @@ The source cluster is started, populated with data, then **stopped cleanly** (to
 1. Copy Region A broker disks to target nodes
 2. Execute Phase 3 surgical edits (delete `quorum-state`, delete `*.log` in metadata dir)
 3. Execute Phase 4 snapshot rewrite (3 surviving brokers)
-4. Write `server.properties` with 3-node voter set
+4. Patch the broker config / recovery overlay with the 3-node voter set
 5. Start all 3 nodes
 
 **What to verify**:
@@ -807,7 +798,7 @@ kafka-console-consumer.sh --bootstrap-server host:9092 \
 
 ### Scenario 3: Stray Detection Safety Net
 
-**What this tests**: That the `file.delete.delay.ms=86400000` safety window works as intended, and that stray detection does NOT fire for correctly configured partitions. This also validates the negative case: what happens if the safety net is needed.
+**What this tests**: That the `file.delete.delay.ms=86400000` safety window works as intended, and that stray detection does NOT fire for correctly configured partitions. This also validates the real negative case for stray detection: metadata/broker identity disagreement.
 
 **Source cluster setup**:
 - 3 topics, 6 partitions each, RF=3
@@ -830,22 +821,26 @@ grep -c "stray" <broker-logs>/*.log
 ```
 
 **Recovery steps — negative case** (deliberately break one thing):
-1. Full recovery process, but intentionally do NOT run the snapshot rewrite
-2. Start cluster with `file.delete.delay.ms=86400000`
+1. Full recovery process, including a correct snapshot rewrite
+2. Before startup, intentionally mutate the rewritten snapshot in the test harness so that a known partition stored on broker 2 no longer lists broker 2 in `Replicas[]`
+3. Start cluster with `file.delete.delay.ms=86400000`
+
+Not running the snapshot rewrite at all is a different failure mode: with original broker IDs preserved, it primarily leaves 9-node assignments and availability problems. It is **not** the cleanest way to test stray detection specifically.
 
 **What to verify (negative case)**:
 
 ```bash
-# Stray directories ARE created (because metadata still references 9 brokers,
-# and our 3 broker IDs are only in some partitions' Replicas[])
+# Stray directories ARE created for the deliberately mis-described partition(s),
+# because the rewritten metadata no longer lists the on-disk broker in Replicas[]
 find <log.dirs> -maxdepth 1 -type d -name "*-stray" | wc -l
-# Assert: > 0 (some partitions were stray-detected)
+# Assert: > 0 (the injected fault caused stray detection)
 
 # But data is NOT yet deleted (within 24h window)
 ls <log.dirs>/*-stray/
 # Assert: partition data files still exist inside stray directories
 
-# Recovery: stop brokers, run the snapshot rewrite, rename -stray dirs back
+# Recovery: stop brokers, replace the mutated snapshot with the correct
+# rewritten snapshot, rename -stray dirs back
 # to original names, restart
 for dir in $(find <log.dirs> -maxdepth 1 -type d -name "*-stray"); do
   original="${dir%-stray}"
@@ -1123,9 +1118,9 @@ find <log.dirs> -maxdepth 1 -type d -name "*-stray" | wc -l
 
 ---
 
-### Scenario 10: ISR Re-establishment and Under-Replication Resolution
+### Scenario 10: RF=1 Steady State and Replica Expansion
 
-**What this tests**: After recovery, all partitions start as RF=1 (one live replica per partition from the snapshot rewrite). This scenario verifies that ISR membership stabilises correctly, that the cluster can later expand replicas if desired, and that the under-replicated state resolves.
+**What this tests**: After recovery, all partitions start as RF=1 (one live replica per partition from the snapshot rewrite). This scenario verifies the intended steady state: `Replicas` and `ISR` both collapse to that single live replica, and later replica expansion via reassignment works cleanly.
 
 **Source cluster setup**:
 - 3 topics, 12 partitions each, RF=3
@@ -1138,14 +1133,14 @@ find <log.dirs> -maxdepth 1 -type d -name "*-stray" | wc -l
 **What to verify**:
 
 ```bash
-# Immediately after start: all partitions are online but under-replicated
-# (each partition has 1 replica in ISR, metadata says 1 replica after rewrite)
+# In the recovered steady state: partitions are online and NOT under-replicated,
+# because metadata now says each partition has exactly 1 replica and 1 ISR member
 kafka-topics.sh --bootstrap-server host:9092 --describe --under-replicated-partitions
-# Assert: initially may show under-replicated; resolves as ISR establishes
+# Assert: empty output after startup settles
 
 # After stabilisation: ISR matches the replica set for each partition
 kafka-topics.sh --bootstrap-server host:9092 --describe --topic topic-a
-# Assert: for each partition, ISR = Replicas (all listed replicas are in sync)
+# Assert: for each partition, Replicas has length 1 and ISR = Replicas
 
 # Verify that partition reassignment works for expanding RF
 cat > expand.json << 'EXPAND'
@@ -1157,14 +1152,14 @@ kafka-reassign-partitions.sh --bootstrap-server host:9092 \
   --reassignment-json-file expand.json --execute
 kafka-reassign-partitions.sh --bootstrap-server host:9092 \
   --reassignment-json-file expand.json --verify
-# Assert: reassignment completes, partition now has replicas on all 3 brokers
+# Assert: reassignment completes; under-replication may appear temporarily during copy
 
 # After reassignment: partition is fully replicated on all 3 brokers
 kafka-topics.sh --bootstrap-server host:9092 --describe --topic topic-a
 # Assert: partition 0 has Replicas=[0,1,2], ISR=[0,1,2]
 ```
 
-**Success criteria**: ISR stabilises for all partitions. Partition reassignment works for expanding RF. No data loss during reassignment.
+**Success criteria**: The recovered RF=1 steady state has `ISR = Replicas` for all partitions and no persistent under-replication. Partition reassignment works for expanding RF. No data loss during reassignment.
 
 ---
 
@@ -1200,6 +1195,8 @@ BEST_CHECKPOINT=$(ls -1 ${NODE0_META}/__cluster_metadata-0/*.checkpoint \
                        ${NODE1_META}/__cluster_metadata-0/*.checkpoint \
                        ${NODE2_META}/__cluster_metadata-0/*.checkpoint \
                   | sort -V | tail -1)
+CHECKPOINT_BASENAME=$(basename "${BEST_CHECKPOINT}")
+REWRITTEN_CHECKPOINT="${PWD}/${CHECKPOINT_BASENAME}"
 
 QUORUM_MODE=$(cat ${NODE0_META}/__cluster_metadata-0/quorum-state \
               | python3 -c "import sys,json; print(json.load(sys.stdin).get('data_version',0))")
@@ -1213,19 +1210,30 @@ for NODE_META in ${NODE0_META} ${NODE1_META} ${NODE2_META}; do
   cp "${BEST_CHECKPOINT}" "${NODE_META}/__cluster_metadata-0/"
 done
 
+# --- Phase 3b: Render recovery broker configs from the existing config baseline ---
+# The helper below is intentionally an overlay step: it starts from each broker's
+# normal config and applies only the recovery-specific overrides.
+for NODE in 0 1 2; do
+  render_recovery_server_properties \
+    --base "/configs/node${NODE}/server.properties" \
+    --output "/recovery/node${NODE}/server.properties" \
+    --node-id "${NODE}" \
+    --controller-voters "0@node0:9093,1@node1:9093,2@node2:9093" \
+    --file-delete-delay-ms 86400000
+done
+
 # --- Phase 4: Snapshot rewrite ---
 snapshot-rewrite-tool \
   --input "${BEST_CHECKPOINT}" \
-  --output rewritten.checkpoint \
+  --output "${REWRITTEN_CHECKPOINT}" \
   --surviving-brokers "0,1,2" \
   --directory-mode UNASSIGNED \
   $([ "${QUORUM_MODE}" = "1" ] && echo "--rewrite-voters")
 
 for NODE_META in ${NODE0_META} ${NODE1_META} ${NODE2_META}; do
-  cp rewritten.checkpoint "${NODE_META}/__cluster_metadata-0/"
-  # Remove original checkpoint (different filename than rewritten)
+  cp "${REWRITTEN_CHECKPOINT}" "${NODE_META}/__cluster_metadata-0/${CHECKPOINT_BASENAME}"
   find "${NODE_META}/__cluster_metadata-0/" -name "*.checkpoint" \
-    ! -name "$(basename rewritten.checkpoint)" -delete
+    ! -name "${CHECKPOINT_BASENAME}" -delete
 done
 
 # --- Phase 5: Pre-start validation ---
@@ -1244,7 +1252,7 @@ done
 
 # --- Phase 6: Start ---
 for NODE in 0 1 2; do
-  ssh node${NODE} "kafka-server-start.sh /path/to/server.properties &"
+  ssh node${NODE} "kafka-server-start.sh /recovery/node${NODE}/server.properties &"
 done
 
 # --- Phase 7: Post-start validation ---
@@ -1267,13 +1275,9 @@ echo "Stray directories: ${STRAYS}"
 # Check consumer groups
 kafka-consumer-groups.sh --bootstrap-server host:9092 --list
 
-# Disable unclean election and reset safety settings
-kafka-configs.sh --bootstrap-server host:9092 \
-  --alter --entity-type brokers --entity-default \
-  --add-config unclean.leader.election.enable=false
-kafka-configs.sh --bootstrap-server host:9092 \
-  --alter --entity-type brokers --entity-default \
-  --add-config file.delete.delay.ms=60000
+# Reconcile the temporary recovery config overlay back to the normal broker config
+# path after validation. This is a config-management step, not a fresh hand-written
+# replacement.
 ```
 
 **What to verify**:
@@ -1289,7 +1293,7 @@ kafka-configs.sh --bootstrap-server host:9092 \
 # - Compacted topic data correct
 # - Transactions resolved
 # - Both log directories functional
-# - Under-replicated state resolves
+# - No persistent under-replicated partitions in the recovered RF=1 steady state
 
 # Additionally: measure total recovery time
 echo "Recovery completed in ${SECONDS} seconds"

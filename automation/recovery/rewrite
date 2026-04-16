@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/.." && pwd -P)/lib/common.sh"
+
+require_cmd jq
+
+scenario_id="${1:-}"
+run_id="${2:-}"
+
+[[ -n "${scenario_id}" && -n "${run_id}" ]] || fail "usage: automation/recovery/rewrite <scenario-id> <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+
+selected_checkpoint_path="$(jq -r '.path' "${SELECTED_CHECKPOINT_JSON}")"
+selected_checkpoint_basename="$(jq -r '.basename' "${SELECTED_CHECKPOINT_JSON}")"
+dynamic_quorum="$(jq -r '.dynamic_quorum' "${QUORUM_STATE_JSON}")"
+rewritten_checkpoint_path="${WORKDIR}/artifacts/rewrite/${selected_checkpoint_basename}"
+rewrite_report_path="${WORKDIR}/artifacts/rewrite/rewrite-report.json"
+expected_command_path="${WORKDIR}/artifacts/rewrite/rewrite-command.txt"
+tool_path="${SNAPSHOT_REWRITE_TOOL:-${REPO_ROOT}/bin/snapshot-rewrite-tool}"
+
+if [[ "${dynamic_quorum}" == "true" ]]; then
+  rewrite_voters_flag="--rewrite-voters"
+else
+  rewrite_voters_flag=""
+fi
+
+{
+  printf '%q ' "${tool_path}" \
+    --input "${selected_checkpoint_path}" \
+    --output "${rewritten_checkpoint_path}" \
+    --surviving-brokers "${SURVIVING_BROKERS}" \
+    --directory-mode UNASSIGNED \
+    --report "${rewrite_report_path}"
+  if [[ -n "${rewrite_voters_flag}" ]]; then
+    printf '%q ' "${rewrite_voters_flag}"
+  fi
+  printf '\n'
+} >"${expected_command_path}"
+
+[[ -x "${tool_path}" ]] || fail "snapshot rewrite tool not found or not executable: ${tool_path}"
+
+log "rewriting metadata checkpoint ${selected_checkpoint_basename}"
+tool_args=(
+  --input "${selected_checkpoint_path}"
+  --output "${rewritten_checkpoint_path}"
+  --surviving-brokers "${SURVIVING_BROKERS}"
+  --directory-mode UNASSIGNED
+  --report "${rewrite_report_path}"
+)
+if [[ -n "${rewrite_voters_flag}" ]]; then
+  tool_args+=(--rewrite-voters)
+fi
+"${tool_path}" "${tool_args[@]}"
+
+for broker_id in 0 1 2; do
+  metadata_dir="${WORKDIR}/brokers/broker-${broker_id}/metadata"
+  find "${metadata_dir}" -maxdepth 1 -type f -name '*.checkpoint' -delete
+  cp "${rewritten_checkpoint_path}" "${metadata_dir}/${selected_checkpoint_basename}"
+done
+
+log "rewritten checkpoint installed into recovery broker metadata directories"

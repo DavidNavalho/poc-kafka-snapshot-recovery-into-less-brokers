@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/.." && pwd -P)/lib/common.sh"
+
+require_cmd docker
+
+scenario_id="${1:-}"
+run_id="${2:-}"
+
+[[ -n "${scenario_id}" && -n "${run_id}" ]] || fail "usage: automation/recovery/down <scenario-id> <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+export RECOVERY_WORKDIR
+
+ensure_dir "${WORKDIR}/artifacts/recovery"
+recovery_compose "${RECOVERY_PROJECT}" logs --no-color >"${WORKDIR}/artifacts/recovery/docker-compose.log" || true
+recovery_compose "${RECOVERY_PROJECT}" down --remove-orphans
+log "recovery cluster ${RECOVERY_PROJECT} stopped"

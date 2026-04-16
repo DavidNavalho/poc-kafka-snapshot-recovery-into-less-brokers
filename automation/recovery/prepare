@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/.." && pwd -P)/lib/common.sh"
+
+require_cmd jq
+require_cmd python3
+
+scenario_id="${1:-}"
+snapshot_label="${2:-baseline-clean-v1}"
+run_id="${3:-$(run_id_utc)}"
+
+[[ -n "${scenario_id}" ]] || fail "usage: automation/recovery/prepare <scenario-id> [snapshot-label] [run-id]"
+
+snapshot_dir="${SNAPSHOTS_ROOT}/${snapshot_label}"
+workdir="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}"
+project_name="$(sanitize_project_name "${scenario_id}-${run_id}")"
+
+[[ -d "${snapshot_dir}" ]] || fail "snapshot label not found: ${snapshot_label}"
+[[ ! -e "${workdir}" ]] || fail "scenario run already exists: ${workdir}"
+
+ensure_dir "${workdir}/brokers"
+ensure_dir "${workdir}/artifacts/prepare"
+ensure_dir "${workdir}/artifacts/rewrite"
+ensure_dir "${workdir}/artifacts/recovery"
+
+for broker_id in 0 1 2; do
+  log "copying snapshot broker ${broker_id} into ${workdir}"
+  copy_tree "${snapshot_dir}/brokers/broker-${broker_id}" "${workdir}/brokers/broker-${broker_id}"
+done
+
+quorum_state_json "${workdir}/brokers/broker-0/metadata/quorum-state" >"${workdir}/artifacts/prepare/quorum-state.json"
+checkpoint_json_for_root "${workdir}/brokers" >"${workdir}/artifacts/prepare/selected-checkpoint.json"
+render_recovery_configs "${workdir}"
+
+for broker_id in 0 1 2; do
+  find "${workdir}/brokers/broker-${broker_id}/metadata" \
+    \( -name 'quorum-state' -o -name '*.log' -o -name '*.checkpoint.part' -o -name '*.checkpoint.deleted' \) \
+    -type f -delete
+done
+
+cp "${snapshot_dir}/manifest.json" "${workdir}/snapshot-manifest.json"
+
+cat >"${workdir}/run.env" <<EOF
+SCENARIO_ID=${scenario_id}
+RUN_ID=${run_id}
+SNAPSHOT_LABEL=${snapshot_label}
+WORKDIR=${workdir}
+RECOVERY_PROJECT=${project_name}
+RECOVERY_WORKDIR=${workdir}
+SURVIVING_BROKERS=0,1,2
+SELECTED_CHECKPOINT_JSON=${workdir}/artifacts/prepare/selected-checkpoint.json
+QUORUM_STATE_JSON=${workdir}/artifacts/prepare/quorum-state.json
+EOF
+
+log "recovery run prepared at ${workdir}"
+log "run env written to ${workdir}/run.env"

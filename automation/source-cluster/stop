@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/.." && pwd -P)/lib/common.sh"
+
+require_cmd docker
+
+open_txn_dir="${SOURCE_ARTIFACTS_ROOT}/open-transaction"
+hold_file="${open_txn_dir}/hold-open-transaction"
+pid_file="${open_txn_dir}/pid"
+
+log "stopping source cluster"
+source_compose stop
+
+if [[ -f "${hold_file}" ]]; then
+  rm -f "${hold_file}"
+fi
+
+if [[ -f "${pid_file}" ]]; then
+  producer_pid="$(cat "${pid_file}")"
+  if kill -0 "${producer_pid}" >/dev/null 2>&1; then
+    kill "${producer_pid}" >/dev/null 2>&1 || true
+    wait "${producer_pid}" 2>/dev/null || true
+  fi
+  rm -f "${pid_file}"
+fi
+
+log "source cluster stopped"

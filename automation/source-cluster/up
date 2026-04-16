@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/.." && pwd -P)/lib/common.sh"
+
+require_cmd docker
+
+prepare_source_dirs
+render_source_configs
+
+log "starting source cluster with image ${KAFKA_IMAGE}"
+source_compose up -d
+wait_for_source_cluster
+log "source cluster is ready"

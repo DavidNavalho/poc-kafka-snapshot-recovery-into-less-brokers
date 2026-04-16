@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/.." && pwd -P)/lib/common.sh"
+
+require_cmd docker
+require_cmd jq
+require_cmd python3
+
+snapshot_label="${1:-baseline-clean-v1}"
+snapshot_dir="${SNAPSHOTS_ROOT}/${snapshot_label}"
+
+[[ ! -e "${snapshot_dir}" ]] || fail "snapshot label already exists: ${snapshot_label}"
+
+if source_compose ps --status running --services | grep -q .; then
+  fail "source cluster is still running; stop it cleanly before taking a snapshot"
+fi
+
+ensure_dir "${snapshot_dir}/brokers"
+for broker_id in {0..8}; do
+  log "copying broker ${broker_id} into snapshot ${snapshot_label}"
+  copy_tree "$(source_broker_dir "${broker_id}")" "${snapshot_dir}/brokers/broker-${broker_id}"
+done
+
+checkpoint_json_for_root "${snapshot_dir}/brokers" >"${snapshot_dir}/selected-checkpoint.json"
+quorum_state_json "${snapshot_dir}/brokers/broker-0/metadata/quorum-state" >"${snapshot_dir}/quorum-state.json"
+python3 "${REPO_ROOT}/automation/lib/source_fixture.py" write-compacted-expectations \
+  --output-dir "${snapshot_dir}/expectations/compacted"
+python3 "${REPO_ROOT}/automation/lib/source_fixture.py" manifest \
+  --snapshot-label "${snapshot_label}" \
+  --created-at-utc "$(timestamp_utc)" \
+  --cluster-id "${KAFKA_CLUSTER_ID}" \
+  --checkpoint-json "${snapshot_dir}/selected-checkpoint.json" \
+  --quorum-state-data-version "$(jq -r '.data_version' "${snapshot_dir}/quorum-state.json")" \
+  --dynamic-quorum "$(jq -r '.dynamic_quorum' "${snapshot_dir}/quorum-state.json")" \
+  --output "${snapshot_dir}/manifest.json"
+
+log "snapshot created at ${snapshot_dir}"

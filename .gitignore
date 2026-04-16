@@ -1,0 +1,15 @@
+.DS_Store
+
+# Generated fixture data
+/fixtures/source-cluster/live/*
+!/fixtures/source-cluster/live/.gitkeep
+/fixtures/source-cluster/artifacts/*
+!/fixtures/source-cluster/artifacts/.gitkeep
+/fixtures/snapshots/*
+!/fixtures/snapshots/.gitkeep
+/fixtures/scenario-runs/*
+!/fixtures/scenario-runs/.gitkeep
+
+# Generated reports
+/docs/recovery/reports/runs/*
+!/docs/recovery/reports/runs/.gitkeep

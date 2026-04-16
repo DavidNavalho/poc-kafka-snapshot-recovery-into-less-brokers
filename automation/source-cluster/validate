@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/.." && pwd -P)/lib/common.sh"
+
+require_cmd docker
+require_cmd jq
+require_cmd python3
+
+wait_for_source_cluster
+
+artifact_dir="${SOURCE_ARTIFACTS_ROOT}/validate/$(run_id_utc)"
+fixture_json_file="${artifact_dir}/fixture.json"
+ensure_dir "${artifact_dir}"
+ensure_dir "${artifact_dir}/topics"
+ensure_dir "${artifact_dir}/groups"
+
+python3 "${REPO_ROOT}/automation/lib/source_fixture.py" fixture-json >"${fixture_json_file}"
+fixture_json="$(cat "${fixture_json_file}")"
+
+log "capturing source cluster quorum status"
+source_compose exec -T kafka-0 kafka-metadata-quorum --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" describe --status >"${artifact_dir}/quorum-status.txt"
+
+log "capturing dynamic broker config"
+source_compose exec -T kafka-0 \
+  kafka-configs \
+  --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" \
+  --entity-type brokers \
+  --entity-name 0 \
+  --describe \
+  --all >"${artifact_dir}/broker-0-config.txt"
+grep -q 'log.retention.hours=48' "${artifact_dir}/broker-0-config.txt" || fail "broker 0 dynamic config missing"
+
+while IFS= read -r topic_json; do
+  topic_name="$(jq -r '.name' <<<"${topic_json}")"
+  partitions="$(jq -r '.partitions' <<<"${topic_json}")"
+  replication_factor="$(jq -r '.replication_factor' <<<"${topic_json}")"
+  describe_file="${artifact_dir}/topics/${topic_name}.describe.txt"
+  offsets_file="${artifact_dir}/topics/${topic_name}.offsets.txt"
+  config_file="${artifact_dir}/topics/${topic_name}.config.txt"
+
+  log "validating topic ${topic_name}"
+  source_compose exec -T kafka-0 \
+    kafka-topics \
+    --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" \
+    --describe \
+    --topic "${topic_name}" >"${describe_file}"
+  grep -q "Topic: ${topic_name}" "${describe_file}" || fail "topic ${topic_name} not found"
+  [[ "$(grep -c 'Partition:' "${describe_file}")" == "${partitions}" ]] || fail "unexpected partition count for ${topic_name}"
+  grep -q "ReplicationFactor: ${replication_factor}" "${describe_file}" || fail "unexpected replication factor for ${topic_name}"
+
+  source_topic_offsets "${topic_name}" >"${offsets_file}"
+  while IFS=' ' read -r partition expected_offset; do
+    grep -qx "${topic_name}:${partition}:${expected_offset}" "${offsets_file}" || fail "unexpected latest offset for ${topic_name} partition ${partition}"
+  done < <(jq -r '.expected_latest_offsets | to_entries[] | "\(.key) \(.value)"' <<<"${topic_json}")
+
+  if jq -e '.configs | length > 0' >/dev/null <<<"${topic_json}"; then
+    source_compose exec -T kafka-0 \
+      kafka-configs \
+      --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" \
+      --entity-type topics \
+      --entity-name "${topic_name}" \
+      --describe >"${config_file}"
+    while IFS= read -r config_entry; do
+      grep -q "${config_entry}" "${config_file}" || fail "missing config ${config_entry} on topic ${topic_name}"
+    done < <(jq -r '.configs | to_entries[] | "\(.key)=\(.value)"' <<<"${topic_json}")
+  fi
+done < <(jq -c '.topics[]' <<<"${fixture_json}")
+
+while IFS= read -r group_json; do
+  group_id="$(jq -r '.group_id' <<<"${group_json}")"
+  topic_name="$(jq -r '.topic' <<<"${group_json}")"
+  group_file="${artifact_dir}/groups/${group_id}.txt"
+  log "validating consumer group ${group_id}"
+  source_compose exec -T kafka-0 \
+    kafka-consumer-groups \
+    --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" \
+    --describe \
+    --group "${group_id}" >"${group_file}"
+  while IFS=' ' read -r partition expected_offset; do
+    awk -v topic="${topic_name}" -v partition="${partition}" -v offset="${expected_offset}" '
+      $1 == topic && $2 == partition && $3 == offset { found = 1 }
+      END { exit(found ? 0 : 1) }
+    ' "${group_file}" || fail "unexpected committed offset for ${group_id} partition ${partition}"
+  done < <(jq -r '.expected_committed_offsets | to_entries[] | "\(.key) \(.value)"' <<<"${group_json}")
+done < <(jq -c '.consumer_groups[]' <<<"${fixture_json}")
+
+txn_read_committed_count="$(source_compose exec -T kafka-0 bash -lc "kafka-console-consumer --bootstrap-server ${SOURCE_BOOTSTRAP_SERVER} --topic recovery.txn.test --from-beginning --consumer-property isolation.level=read_committed --timeout-ms 10000 2>/dev/null | wc -l" | tr -d '[:space:]')"
+[[ "${txn_read_committed_count}" == "600" ]] || fail "unexpected read_committed message count for recovery.txn.test"
+
+log "source fixture validation passed; artifacts: ${artifact_dir}"

@@ -1,0 +1,79 @@
+name: recovery-cluster
+
+x-kafka-common: &kafka-common
+  image: ${KAFKA_IMAGE:?set KAFKA_IMAGE}
+  restart: unless-stopped
+  networks:
+    - harness
+  healthcheck:
+    test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+    interval: 15s
+    timeout: 10s
+    retries: 10
+    start_period: 20s
+
+services:
+  kafka-0:
+    <<: *kafka-common
+    hostname: kafka-0
+    ports: ["29092:9094"]
+    environment: &recovery-env-0
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:?set KAFKA_CLUSTER_ID}
+      KAFKA_NODE_ID: 0
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-0:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 0@kafka-0:9093,1@kafka-1:9093,2@kafka-2:9093
+      KAFKA_LOG_DIRS: /var/lib/kafka/data-0,/var/lib/kafka/data-1
+      KAFKA_METADATA_LOG_DIR: /var/lib/kafka/metadata
+      KAFKA_BROKER_RACK: rack-a
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_DELETE_TOPIC_ENABLE: "true"
+    volumes:
+      - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-0/metadata:/var/lib/kafka/metadata
+      - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-0/logdir-0:/var/lib/kafka/data-0
+      - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-0/logdir-1:/var/lib/kafka/data-1
+      - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-0/rendered-config:/var/lib/kafka/rendered-config
+
+  kafka-1:
+    <<: *kafka-common
+    hostname: kafka-1
+    ports: ["29093:9094"]
+    environment:
+      <<: *recovery-env-0
+      KAFKA_NODE_ID: 1
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-1:9092,EXTERNAL://localhost:29093
+      KAFKA_BROKER_RACK: rack-a
+    volumes:
+      - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-1/metadata:/var/lib/kafka/metadata
+      - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-1/logdir-0:/var/lib/kafka/data-0
+      - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-1/logdir-1:/var/lib/kafka/data-1
+      - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-1/rendered-config:/var/lib/kafka/rendered-config
+
+  kafka-2:
+    <<: *kafka-common
+    hostname: kafka-2
+    ports: ["29094:9094"]
+    environment:
+      <<: *recovery-env-0
+      KAFKA_NODE_ID: 2
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-2:9092,EXTERNAL://localhost:29094
+      KAFKA_BROKER_RACK: rack-a
+    volumes:
+      - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-2/metadata:/var/lib/kafka/metadata
+      - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-2/logdir-0:/var/lib/kafka/data-0
+      - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-2/logdir-1:/var/lib/kafka/data-1
+      - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-2/rendered-config:/var/lib/kafka/rendered-config
+
+networks:
+  harness:
+    name: ${HARNESS_NETWORK:?set HARNESS_NETWORK}

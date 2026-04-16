@@ -1,0 +1,169 @@
+name: source-cluster
+
+x-kafka-common: &kafka-common
+  image: ${KAFKA_IMAGE:?set KAFKA_IMAGE}
+  restart: unless-stopped
+  networks:
+    - harness
+  healthcheck:
+    test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+    interval: 15s
+    timeout: 10s
+    retries: 10
+    start_period: 20s
+
+services:
+  kafka-0:
+    <<: *kafka-common
+    hostname: kafka-0
+    ports: ["19092:9094"]
+    environment: &source-env-0
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:?set KAFKA_CLUSTER_ID}
+      KAFKA_NODE_ID: 0
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-0:9092,EXTERNAL://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 0@kafka-0:9093,1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093,4@kafka-4:9093,5@kafka-5:9093,6@kafka-6:9093,7@kafka-7:9093,8@kafka-8:9093
+      KAFKA_LOG_DIRS: /var/lib/kafka/data-0,/var/lib/kafka/data-1
+      KAFKA_METADATA_LOG_DIR: /var/lib/kafka/metadata
+      KAFKA_BROKER_RACK: rack-a
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_DELETE_TOPIC_ENABLE: "true"
+    volumes: &source-volumes-0
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-0/metadata:/var/lib/kafka/metadata
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-0/logdir-0:/var/lib/kafka/data-0
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-0/logdir-1:/var/lib/kafka/data-1
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-0/rendered-config:/var/lib/kafka/rendered-config
+
+  kafka-1:
+    <<: *kafka-common
+    hostname: kafka-1
+    ports: ["19093:9094"]
+    environment:
+      <<: *source-env-0
+      KAFKA_NODE_ID: 1
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-1:9092,EXTERNAL://localhost:19093
+      KAFKA_BROKER_RACK: rack-a
+    volumes:
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-1/metadata:/var/lib/kafka/metadata
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-1/logdir-0:/var/lib/kafka/data-0
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-1/logdir-1:/var/lib/kafka/data-1
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-1/rendered-config:/var/lib/kafka/rendered-config
+
+  kafka-2:
+    <<: *kafka-common
+    hostname: kafka-2
+    ports: ["19094:9094"]
+    environment:
+      <<: *source-env-0
+      KAFKA_NODE_ID: 2
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-2:9092,EXTERNAL://localhost:19094
+      KAFKA_BROKER_RACK: rack-a
+    volumes:
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-2/metadata:/var/lib/kafka/metadata
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-2/logdir-0:/var/lib/kafka/data-0
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-2/logdir-1:/var/lib/kafka/data-1
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-2/rendered-config:/var/lib/kafka/rendered-config
+
+  kafka-3:
+    <<: *kafka-common
+    hostname: kafka-3
+    ports: ["19095:9094"]
+    environment:
+      <<: *source-env-0
+      KAFKA_NODE_ID: 3
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-3:9092,EXTERNAL://localhost:19095
+      KAFKA_BROKER_RACK: rack-b
+    volumes:
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-3/metadata:/var/lib/kafka/metadata
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-3/logdir-0:/var/lib/kafka/data-0
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-3/logdir-1:/var/lib/kafka/data-1
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-3/rendered-config:/var/lib/kafka/rendered-config
+
+  kafka-4:
+    <<: *kafka-common
+    hostname: kafka-4
+    ports: ["19096:9094"]
+    environment:
+      <<: *source-env-0
+      KAFKA_NODE_ID: 4
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-4:9092,EXTERNAL://localhost:19096
+      KAFKA_BROKER_RACK: rack-b
+    volumes:
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-4/metadata:/var/lib/kafka/metadata
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-4/logdir-0:/var/lib/kafka/data-0
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-4/logdir-1:/var/lib/kafka/data-1
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-4/rendered-config:/var/lib/kafka/rendered-config
+
+  kafka-5:
+    <<: *kafka-common
+    hostname: kafka-5
+    ports: ["19097:9094"]
+    environment:
+      <<: *source-env-0
+      KAFKA_NODE_ID: 5
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-5:9092,EXTERNAL://localhost:19097
+      KAFKA_BROKER_RACK: rack-b
+    volumes:
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-5/metadata:/var/lib/kafka/metadata
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-5/logdir-0:/var/lib/kafka/data-0
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-5/logdir-1:/var/lib/kafka/data-1
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-5/rendered-config:/var/lib/kafka/rendered-config
+
+  kafka-6:
+    <<: *kafka-common
+    hostname: kafka-6
+    ports: ["19098:9094"]
+    environment:
+      <<: *source-env-0
+      KAFKA_NODE_ID: 6
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-6:9092,EXTERNAL://localhost:19098
+      KAFKA_BROKER_RACK: rack-c
+    volumes:
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-6/metadata:/var/lib/kafka/metadata
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-6/logdir-0:/var/lib/kafka/data-0
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-6/logdir-1:/var/lib/kafka/data-1
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-6/rendered-config:/var/lib/kafka/rendered-config
+
+  kafka-7:
+    <<: *kafka-common
+    hostname: kafka-7
+    ports: ["19099:9094"]
+    environment:
+      <<: *source-env-0
+      KAFKA_NODE_ID: 7
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-7:9092,EXTERNAL://localhost:19099
+      KAFKA_BROKER_RACK: rack-c
+    volumes:
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-7/metadata:/var/lib/kafka/metadata
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-7/logdir-0:/var/lib/kafka/data-0
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-7/logdir-1:/var/lib/kafka/data-1
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-7/rendered-config:/var/lib/kafka/rendered-config
+
+  kafka-8:
+    <<: *kafka-common
+    hostname: kafka-8
+    ports: ["19100:9094"]
+    environment:
+      <<: *source-env-0
+      KAFKA_NODE_ID: 8
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-8:9092,EXTERNAL://localhost:19100
+      KAFKA_BROKER_RACK: rack-c
+    volumes:
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-8/metadata:/var/lib/kafka/metadata
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-8/logdir-0:/var/lib/kafka/data-0
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-8/logdir-1:/var/lib/kafka/data-1
+      - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-8/rendered-config:/var/lib/kafka/rendered-config
+
+networks:
+  harness:
+    name: ${HARNESS_NETWORK:?set HARNESS_NETWORK}
