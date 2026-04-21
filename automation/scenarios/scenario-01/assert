@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+require_cmd docker
+require_cmd jq
+require_cmd rg
+
+scenario_id="scenario-01"
+run_id="${1:-}"
+
+[[ -n "${run_id}" ]] || fail "usage: automation/scenarios/scenario-01/assert <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+export RECOVERY_WORKDIR="${WORKDIR}"
+
+assert_dir="${WORKDIR}/artifacts/assert"
+topic_artifact_dir="${assert_dir}/topics"
+recovery_artifact_dir="${WORKDIR}/artifacts/recovery"
+startup_failure_scan_path="${assert_dir}/startup-failure-scan.txt"
+secondary_anomalies_path="${assert_dir}/secondary-anomalies.txt"
+quorum_status_path="${assert_dir}/quorum-status.txt"
+recovery_ps_path="${assert_dir}/recovery-ps.txt"
+assertions_jsonl_path="${assert_dir}/assertions.jsonl"
+summary_path="${assert_dir}/assert-summary.json"
+rewrite_report_path="${WORKDIR}/artifacts/rewrite/rewrite-report.json"
+rewrite_metadata_log_path="${WORKDIR}/artifacts/rewrite/00000000000000000000.log"
+rewrite_metadata_index_path="${WORKDIR}/artifacts/rewrite/00000000000000000000.index"
+rewrite_metadata_timeindex_path="${WORKDIR}/artifacts/rewrite/00000000000000000000.timeindex"
+recovery_log_path="${recovery_artifact_dir}/docker-compose.log"
+snapshot_manifest_path="${WORKDIR}/snapshot-manifest.json"
+
+ensure_dir "${assert_dir}"
+ensure_dir "${topic_artifact_dir}"
+ensure_dir "${recovery_artifact_dir}"
+: >"${assertions_jsonl_path}"
+
+had_failure=0
+
+record_assertion() {
+  local id="$1"
+  local name="$2"
+  local result="$3"
+  local evidence="$4"
+  local details="$5"
+
+  if [[ "${result}" != "PASS" ]]; then
+    had_failure=1
+  fi
+
+  jq -nc \
+    --arg id "${id}" \
+    --arg name "${name}" \
+    --arg result "${result}" \
+    --arg evidence "${evidence}" \
+    --arg details "${details}" \
+    '{id: $id, name: $name, result: $result, evidence: $evidence, details: $details}' >>"${assertions_jsonl_path}"
+}
+
+write_scan_output() {
+  local source_path="$1"
+  local pattern="$2"
+  local output_path="$3"
+  local empty_message="$4"
+
+  if [[ ! -f "${source_path}" ]]; then
+    printf 'source file missing: %s\n' "${source_path}" >"${output_path}"
+    return 2
+  fi
+
+  if rg -ni --no-heading --color never "${pattern}" "${source_path}" >"${output_path}"; then
+    return 0
+  fi
+
+  printf '%s\n' "${empty_message}" >"${output_path}"
+  return 1
+}
+
+capture_recovery_state() {
+  recovery_compose "${RECOVERY_PROJECT}" logs --no-color >"${recovery_log_path}" || true
+  recovery_compose "${RECOVERY_PROJECT}" ps >"${recovery_ps_path}" || true
+}
+
+capture_recovery_state
+
+selected_checkpoint_basename="$(jq -r '.basename // empty' "${SELECTED_CHECKPOINT_JSON}")"
+expected_cluster_id="$(jq -r '.cluster.cluster_id // empty' "${snapshot_manifest_path}")"
+expected_dynamic_quorum="$(jq -r '.metadata_snapshot.dynamic_quorum // empty' "${snapshot_manifest_path}")"
+
+a1_details=()
+if [[ ! -f "${rewrite_report_path}" ]]; then
+  a1_details+=("rewrite report missing")
+else
+  rewrite_status="$(jq -r '.status // empty' "${rewrite_report_path}")"
+  surviving_brokers_csv="$(jq -r '.surviving_brokers // [] | join(",")' "${rewrite_report_path}")"
+  directory_mode="$(jq -r '.directory_mode // empty' "${rewrite_report_path}")"
+  missing_survivors="$(jq -r '.partitions.missing_survivors // empty' "${rewrite_report_path}")"
+  missing_partitions_count="$(jq -r '.missing_partitions // [] | length' "${rewrite_report_path}")"
+  input_basename="$(jq -r '.input_checkpoint.basename // empty' "${rewrite_report_path}")"
+  output_basename="$(jq -r '.output_checkpoint.basename // empty' "${rewrite_report_path}")"
+  rewrite_voters_requested="$(jq -r '.quorum.rewrite_voters_requested // empty' "${rewrite_report_path}")"
+
+  [[ "${rewrite_status}" == "success" ]] || a1_details+=("status=${rewrite_status}")
+  [[ "${surviving_brokers_csv}" == "0,1,2" ]] || a1_details+=("surviving_brokers=${surviving_brokers_csv}")
+  [[ "${directory_mode}" == "UNASSIGNED" ]] || a1_details+=("directory_mode=${directory_mode}")
+  [[ "${missing_survivors}" == "0" ]] || a1_details+=("missing_survivors=${missing_survivors}")
+  [[ "${missing_partitions_count}" == "0" ]] || a1_details+=("missing_partitions_count=${missing_partitions_count}")
+  [[ -n "${selected_checkpoint_basename}" && "${input_basename}" == "${selected_checkpoint_basename}" ]] || a1_details+=("input_checkpoint=${input_basename}")
+  [[ -n "${selected_checkpoint_basename}" && "${output_basename}" == "${selected_checkpoint_basename}" ]] || a1_details+=("output_checkpoint=${output_basename}")
+  if [[ "${expected_dynamic_quorum}" == "true" ]]; then
+    [[ "${rewrite_voters_requested}" == "true" ]] || a1_details+=("rewrite_voters_requested=${rewrite_voters_requested}")
+  elif [[ "${expected_dynamic_quorum}" == "false" ]]; then
+    [[ "${rewrite_voters_requested}" == "false" ]] || a1_details+=("rewrite_voters_requested=${rewrite_voters_requested}")
+  fi
+fi
+
+if [[ "${#a1_details[@]}" -eq 0 ]]; then
+  record_assertion "A1" "Rewrite report succeeded" "PASS" "${rewrite_report_path}" "rewrite report matched expected success contract"
+else
+  record_assertion "A1" "Rewrite report succeeded" "FAIL" "${rewrite_report_path}" "$(printf '%s; ' "${a1_details[@]}" | sed 's/; $//')"
+fi
+
+a2_details=()
+for broker_id in 0 1 2; do
+  metadata_dir="$(metadata_snapshot_dir "${WORKDIR}/brokers/broker-${broker_id}/metadata")"
+  checkpoint_path="${metadata_dir}/${selected_checkpoint_basename}"
+  if [[ ! -d "${metadata_dir}" ]]; then
+    a2_details+=("broker-${broker_id}-metadata-dir-missing")
+    continue
+  fi
+  [[ -f "${metadata_dir}/partition.metadata" ]] || a2_details+=("broker-${broker_id}-partition.metadata-missing")
+  [[ -f "${metadata_dir}/leader-epoch-checkpoint" ]] || a2_details+=("broker-${broker_id}-leader-epoch-checkpoint-missing")
+  [[ -f "${metadata_dir}/quorum-state" ]] || a2_details+=("broker-${broker_id}-quorum-state-missing")
+  [[ -f "${checkpoint_path}" ]] || a2_details+=("broker-${broker_id}-checkpoint-missing")
+  [[ -f "${metadata_dir}/00000000000000000000.log" ]] || a2_details+=("broker-${broker_id}-metadata-log-missing")
+  [[ -f "${metadata_dir}/00000000000000000000.index" ]] || a2_details+=("broker-${broker_id}-metadata-index-missing")
+  [[ -f "${metadata_dir}/00000000000000000000.timeindex" ]] || a2_details+=("broker-${broker_id}-metadata-timeindex-missing")
+done
+[[ -f "${rewrite_metadata_log_path}" ]] || a2_details+=("rewrite-metadata-log-artifact-missing")
+[[ -f "${rewrite_metadata_index_path}" ]] || a2_details+=("rewrite-metadata-index-artifact-missing")
+[[ -f "${rewrite_metadata_timeindex_path}" ]] || a2_details+=("rewrite-metadata-timeindex-artifact-missing")
+
+if [[ "${#a2_details[@]}" -eq 0 ]]; then
+  record_assertion "A2" "Rewritten files were installed into every recovery metadata directory" "PASS" "${WORKDIR}/brokers" "rewritten checkpoint, metadata log, sidecar indexes, leader epoch checkpoint, and quorum state present for brokers 0,1,2"
+else
+  record_assertion "A2" "Rewritten files were installed into every recovery metadata directory" "FAIL" "${WORKDIR}/brokers" "$(printf '%s; ' "${a2_details[@]}" | sed 's/; $//')"
+fi
+
+a3_details=()
+if recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 kafka-metadata-quorum --bootstrap-server kafka-0:9092 describe --status </dev/null >"${quorum_status_path}"; then
+  quorum_cluster_id="$(sed -n 's/^ClusterId:[[:space:]]*//p' "${quorum_status_path}" | tr -d '[:space:]')"
+  quorum_leader_id="$(sed -n 's/^LeaderId:[[:space:]]*//p' "${quorum_status_path}" | tr -d '[:space:]')"
+  current_voters_json="$(sed -n 's/^CurrentVoters:[[:space:]]*//p' "${quorum_status_path}")"
+  if [[ -z "${current_voters_json}" ]]; then
+    a3_details+=("missing-current-voters")
+  else
+    voter_ids_csv="$(printf '%s\n' "${current_voters_json}" | jq -r 'sort_by(.id) | map(.id | tostring) | join(",")' 2>/dev/null || printf 'parse-error')"
+    voter_count="$(printf '%s\n' "${current_voters_json}" | jq -r 'length' 2>/dev/null || printf 'parse-error')"
+    [[ "${voter_ids_csv}" == "0,1,2" ]] || a3_details+=("voters=${voter_ids_csv}")
+    [[ "${voter_count}" == "3" ]] || a3_details+=("voter_count=${voter_count}")
+  fi
+  [[ -n "${expected_cluster_id}" && "${quorum_cluster_id}" == "${expected_cluster_id}" ]] || a3_details+=("cluster_id=${quorum_cluster_id}")
+  case "${quorum_leader_id}" in
+    0|1|2) ;;
+    *) a3_details+=("leader_id=${quorum_leader_id}") ;;
+  esac
+else
+  a3_details+=("kafka-metadata-quorum-command-failed")
+fi
+
+if [[ "${#a3_details[@]}" -eq 0 ]]; then
+  record_assertion "A3" "Metadata quorum formed as a 3-node recovery quorum" "PASS" "${quorum_status_path}" "quorum status reports voters 0,1,2 and a valid leader"
+else
+  record_assertion "A3" "Metadata quorum formed as a 3-node recovery quorum" "FAIL" "${quorum_status_path}" "$(printf '%s; ' "${a3_details[@]}" | sed 's/; $//')"
+fi
+
+a4_details=()
+while IFS=$'\t' read -r topic_name partition_count; do
+  describe_path="${topic_artifact_dir}/${topic_name}.describe.txt"
+  unavailable_path="${topic_artifact_dir}/${topic_name}.unavailable.txt"
+
+  if ! recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 kafka-topics --bootstrap-server kafka-0:9092 --describe --topic "${topic_name}" </dev/null >"${describe_path}"; then
+    a4_details+=("${topic_name}:describe-command-failed")
+    continue
+  fi
+
+  if ! recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 kafka-topics --bootstrap-server kafka-0:9092 --describe --topic "${topic_name}" --unavailable-partitions </dev/null >"${unavailable_path}"; then
+    a4_details+=("${topic_name}:unavailable-command-failed")
+    continue
+  fi
+
+  grep -q "Topic: ${topic_name}" "${describe_path}" || a4_details+=("${topic_name}:missing-topic")
+  actual_partition_count="$(grep -c 'Partition:' "${describe_path}" || true)"
+  [[ "${actual_partition_count}" == "${partition_count}" ]] || a4_details+=("${topic_name}:partition-count=${actual_partition_count}")
+
+  if [[ -n "$(tr -d '[:space:]' <"${unavailable_path}")" ]]; then
+    a4_details+=("${topic_name}:has-unavailable-partitions")
+  fi
+done < <(jq -r '.topics[] | select(.replication_factor == 3) | [.name, (.partitions | tostring)] | @tsv' "${snapshot_manifest_path}")
+
+if [[ "${#a4_details[@]}" -eq 0 ]]; then
+  record_assertion "A4" "All in-scope manifest topics exist and have no unavailable partitions" "PASS" "${topic_artifact_dir}" "all manifest topics with replication_factor=3 described successfully and reported no unavailable partitions"
+else
+  record_assertion "A4" "All in-scope manifest topics exist and have no unavailable partitions" "FAIL" "${topic_artifact_dir}" "$(printf '%s; ' "${a4_details[@]}" | sed 's/; $//')"
+fi
+
+failure_pattern='Encountered fatal fault|ProcessTerminatingFaultHandler|Unexpected error in raft IO thread|stray|-stray|meta\.properties.*(mismatch|inconsistent|error|exception)|cluster[._]?id.*(mismatch|inconsistent|error|exception)|controller\.quorum\.voters.*(mismatch|inconsistent|error|exception)|voter.*(mismatch|inconsistent)'
+secondary_pattern='UnknownHostException: kafka-[0-9]+|overlapping ISR=.*ELR|StaleBrokerEpochException'
+
+set +e
+write_scan_output "${recovery_log_path}" "${failure_pattern}" "${startup_failure_scan_path}" "no startup failure patterns detected"
+failure_scan_status=$?
+write_scan_output "${recovery_log_path}" "${secondary_pattern}" "${secondary_anomalies_path}" "no secondary anomalies detected"
+secondary_scan_status=$?
+set -e
+
+if [[ "${failure_scan_status}" -eq 0 ]]; then
+  record_assertion "A5" "No explicit metadata-identity or stray-detection startup failure" "FAIL" "${startup_failure_scan_path}" "startup failure patterns detected in recovery logs"
+elif [[ "${failure_scan_status}" -eq 2 ]]; then
+  record_assertion "A5" "No explicit metadata-identity or stray-detection startup failure" "FAIL" "${startup_failure_scan_path}" "recovery log file missing"
+else
+  record_assertion "A5" "No explicit metadata-identity or stray-detection startup failure" "PASS" "${startup_failure_scan_path}" "no explicit startup failure patterns detected"
+fi
+
+summary_status="pass"
+if [[ "${had_failure}" -ne 0 ]]; then
+  summary_status="fail"
+fi
+
+jq -s \
+  --arg scenario "${scenario_id}" \
+  --arg run_id "${run_id}" \
+  --arg snapshot_label "${SNAPSHOT_LABEL}" \
+  --arg status "${summary_status}" \
+  --arg generated_at_utc "$(timestamp_utc)" \
+  '{
+    scenario: $scenario,
+    run_id: $run_id,
+    snapshot_label: $snapshot_label,
+    status: $status,
+    generated_at_utc: $generated_at_utc,
+    assertions: .
+  }' "${assertions_jsonl_path}" >"${summary_path}"
+
+log "scenario 01 assert artifacts written to ${assert_dir}"
+
+if [[ "${summary_status}" != "pass" ]]; then
+  exit 1
+fi

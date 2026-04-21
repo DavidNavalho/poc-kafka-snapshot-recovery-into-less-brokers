@@ -18,7 +18,7 @@ export RECOVERY_WORKDIR
 
 selected_checkpoint_basename="$(jq -r '.basename' "${SELECTED_CHECKPOINT_JSON}")"
 for broker_id in 0 1 2; do
-  checkpoint_path="${WORKDIR}/brokers/broker-${broker_id}/metadata/${selected_checkpoint_basename}"
+  checkpoint_path="$(metadata_snapshot_dir "${WORKDIR}/brokers/broker-${broker_id}/metadata")/${selected_checkpoint_basename}"
   [[ -f "${checkpoint_path}" ]] || fail "rewritten checkpoint not installed for broker ${broker_id}: ${checkpoint_path}"
 done
 

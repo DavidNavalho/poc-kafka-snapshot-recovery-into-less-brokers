@@ -6,9 +6,16 @@ source "$(cd "$(dirname "$0")/.." && pwd -P)/lib/common.sh"
 
 require_cmd docker
 require_cmd jq
-require_cmd python3
 
-wait_for_source_cluster
+source_ready=0
+for _ in $(seq 1 30); do
+  if source_compose exec -T kafka-0 kafka-topics --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" --list </dev/null >/dev/null 2>&1; then
+    source_ready=1
+    break
+  fi
+  sleep 2
+done
+[[ "${source_ready}" == "1" ]] || fail "source cluster is not ready"
 
 artifact_dir="${SOURCE_ARTIFACTS_ROOT}/validate/$(run_id_utc)"
 fixture_json_file="${artifact_dir}/fixture.json"
@@ -16,11 +23,11 @@ ensure_dir "${artifact_dir}"
 ensure_dir "${artifact_dir}/topics"
 ensure_dir "${artifact_dir}/groups"
 
-python3 "${REPO_ROOT}/automation/lib/source_fixture.py" fixture-json >"${fixture_json_file}"
+toolbox_python "${REPO_ROOT}/automation/lib/source_fixture.py" fixture-json >"${fixture_json_file}"
 fixture_json="$(cat "${fixture_json_file}")"
 
 log "capturing source cluster quorum status"
-source_compose exec -T kafka-0 kafka-metadata-quorum --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" describe --status >"${artifact_dir}/quorum-status.txt"
+source_compose exec -T kafka-0 kafka-metadata-quorum --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" describe --status </dev/null >"${artifact_dir}/quorum-status.txt"
 
 log "capturing dynamic broker config"
 source_compose exec -T kafka-0 \
@@ -29,8 +36,8 @@ source_compose exec -T kafka-0 \
   --entity-type brokers \
   --entity-name 0 \
   --describe \
-  --all >"${artifact_dir}/broker-0-config.txt"
-grep -q 'log.retention.hours=48' "${artifact_dir}/broker-0-config.txt" || fail "broker 0 dynamic config missing"
+  --all </dev/null >"${artifact_dir}/broker-0-config.txt"
+grep -q 'log.retention.hours=48' "${artifact_dir}/broker-0-config.txt" || fail "broker 0 retention config missing"
 
 while IFS= read -r topic_json; do
   topic_name="$(jq -r '.name' <<<"${topic_json}")"
@@ -45,7 +52,7 @@ while IFS= read -r topic_json; do
     kafka-topics \
     --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" \
     --describe \
-    --topic "${topic_name}" >"${describe_file}"
+    --topic "${topic_name}" </dev/null >"${describe_file}"
   grep -q "Topic: ${topic_name}" "${describe_file}" || fail "topic ${topic_name} not found"
   [[ "$(grep -c 'Partition:' "${describe_file}")" == "${partitions}" ]] || fail "unexpected partition count for ${topic_name}"
   grep -q "ReplicationFactor: ${replication_factor}" "${describe_file}" || fail "unexpected replication factor for ${topic_name}"
@@ -61,7 +68,7 @@ while IFS= read -r topic_json; do
       --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" \
       --entity-type topics \
       --entity-name "${topic_name}" \
-      --describe >"${config_file}"
+      --describe </dev/null >"${config_file}"
     while IFS= read -r config_entry; do
       grep -q "${config_entry}" "${config_file}" || fail "missing config ${config_entry} on topic ${topic_name}"
     done < <(jq -r '.configs | to_entries[] | "\(.key)=\(.value)"' <<<"${topic_json}")
@@ -77,7 +84,7 @@ while IFS= read -r group_json; do
     kafka-consumer-groups \
     --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" \
     --describe \
-    --group "${group_id}" >"${group_file}"
+    --group "${group_id}" </dev/null >"${group_file}"
   while IFS=' ' read -r partition expected_offset; do
     awk -v topic="${topic_name}" -v partition="${partition}" -v offset="${expected_offset}" '
       $1 == topic && $2 == partition && $3 == offset { found = 1 }

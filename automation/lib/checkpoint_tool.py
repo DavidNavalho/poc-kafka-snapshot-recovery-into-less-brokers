@@ -39,7 +39,9 @@ def command_select(args: argparse.Namespace) -> int:
     if not root.exists():
         raise SystemExit(f"search root does not exist: {root}")
     checkpoints = sorted(
-        path for path in root.rglob("*.checkpoint") if "metadata" in path.parts
+        path
+        for path in root.rglob("*.checkpoint")
+        if path.parent.name == "__cluster_metadata-0" and CHECKPOINT_RE.match(path.name)
     )
     if not checkpoints:
         raise SystemExit(f"no checkpoint files found under {root}")

@@ -1,8 +1,13 @@
 .DS_Store
+/.m2/
+/tooling/snapshot-rewrite/target/
+__pycache__/
 
 # Generated fixture data
 /fixtures/source-cluster/live/*
 !/fixtures/source-cluster/live/.gitkeep
+/fixtures/source-cluster/live.failed-seed-*
+/fixtures/source-cluster/live.pre-static-retention-*
 /fixtures/source-cluster/artifacts/*
 !/fixtures/source-cluster/artifacts/.gitkeep
 /fixtures/snapshots/*

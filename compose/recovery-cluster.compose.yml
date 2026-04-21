@@ -38,7 +38,9 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_DELETE_TOPIC_ENABLE: "true"
+      KAFKA_FILE_DELETE_DELAY_MS: 86400000
     volumes:
+      - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-0/data-root:/var/lib/kafka/data
       - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-0/metadata:/var/lib/kafka/metadata
       - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-0/logdir-0:/var/lib/kafka/data-0
       - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-0/logdir-1:/var/lib/kafka/data-1
@@ -54,6 +56,7 @@ services:
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-1:9092,EXTERNAL://localhost:29093
       KAFKA_BROKER_RACK: rack-a
     volumes:
+      - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-1/data-root:/var/lib/kafka/data
       - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-1/metadata:/var/lib/kafka/metadata
       - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-1/logdir-0:/var/lib/kafka/data-0
       - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-1/logdir-1:/var/lib/kafka/data-1
@@ -69,6 +72,7 @@ services:
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-2:9092,EXTERNAL://localhost:29094
       KAFKA_BROKER_RACK: rack-a
     volumes:
+      - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-2/data-root:/var/lib/kafka/data
       - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-2/metadata:/var/lib/kafka/metadata
       - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-2/logdir-0:/var/lib/kafka/data-0
       - ${RECOVERY_WORKDIR:?set RECOVERY_WORKDIR}/brokers/broker-2/logdir-1:/var/lib/kafka/data-1
@@ -76,4 +80,3 @@ services:
 
 networks:
   harness:
-    name: ${HARNESS_NETWORK:?set HARNESS_NETWORK}

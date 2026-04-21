@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+image_tag="${SNAPSHOT_REWRITE_TOOL_IMAGE:-poc-snapshot-rewrite-tool:dev}"
+dockerfile_path="${repo_root}/tooling/snapshot-rewrite.Dockerfile"
+source_root="${repo_root}/tooling/snapshot-rewrite"
+build_state_dir="${source_root}/target"
+build_hash_path="${build_state_dir}/.wrapper-source-hash"
+
+if [[ ! -f "${dockerfile_path}" ]]; then
+  printf 'snapshot rewrite Dockerfile not found: %s\n' "${dockerfile_path}" >&2
+  exit 1
+fi
+
+compute_source_hash() {
+  local -a inputs
+  inputs=("${dockerfile_path}")
+  while IFS= read -r source_file; do
+    inputs+=("${source_file}")
+  done < <(find "${source_root}/src" -type f | sort)
+  inputs+=("${source_root}/pom.xml")
+  shasum -a 256 "${inputs[@]}" | shasum -a 256 | awk '{print $1}'
+}
+
+source_hash="$(compute_source_hash)"
+previous_hash=""
+if [[ -f "${build_hash_path}" ]]; then
+  previous_hash="$(<"${build_hash_path}")"
+fi
+
+if [[ "${SNAPSHOT_REWRITE_TOOL_REBUILD:-0}" == "1" ]] || ! docker image inspect "${image_tag}" >/dev/null 2>&1 || [[ "${source_hash}" != "${previous_hash}" ]]; then
+  mkdir -p "${build_state_dir}"
+  docker build \
+    --file "${dockerfile_path}" \
+    --tag "${image_tag}" \
+    "${repo_root}" >/dev/null
+  printf '%s\n' "${source_hash}" >"${build_hash_path}"
+fi
+
+exec docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  --volume "${repo_root}:${repo_root}" \
+  --workdir "${repo_root}" \
+  "${image_tag}" \
+  "$@"

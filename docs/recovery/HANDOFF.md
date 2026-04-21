@@ -6,14 +6,18 @@ This file captures the current implementation state of the Docker-based Kafka re
 
 ## Current State
 
-The repo is no longer spec-only. The first implementation pass of the harness foundation is in place:
+The repo is no longer spec-only. The current state is:
 
 - recovery validation docs are organized under `docs/recovery/`
 - the canonical source fixture and rewrite-tool contracts are pinned in the docs
 - the source-cluster and recovery-cluster Docker Compose files exist
 - the source-cluster lifecycle scripts exist
-- the recovery preparation and startup scaffolding exists
-- generated fixture data paths are ignored via `.gitignore`
+- the recovery preparation, rewrite, startup, and teardown scripts exist
+- the snapshot rewrite tool exists behind `bin/snapshot-rewrite-tool` and is implemented under `tooling/snapshot-rewrite/`
+- Scenario 01 is fully automated and passed cleanly on 2026-04-21 with run ID `20260421T084355Z`
+- the broader scenario suite is still pending
+
+Use [`scenario-implementation-roadmap.md`](./scenario-implementation-roadmap.md) as the authoritative execution plan. Scenario 01 is the completed anchor; Scenario 02 is the next implementation target.
 
 ## Implemented Files
 
@@ -21,6 +25,12 @@ The repo is no longer spec-only. The first implementation pass of the harness fo
 
 - `compose/source-cluster.compose.yml`
 - `compose/recovery-cluster.compose.yml`
+
+### Snapshot Rewrite Tool
+
+- `bin/snapshot-rewrite-tool`
+- `tooling/snapshot-rewrite.Dockerfile`
+- `tooling/snapshot-rewrite/`
 
 ### Shared Automation Helpers
 
@@ -45,6 +55,11 @@ The repo is no longer spec-only. The first implementation pass of the harness fo
 - `automation/recovery/up`
 - `automation/recovery/down`
 
+### Targeted Recovery Tests
+
+- `automation/tests/rewrite_cleanup_test.sh`
+- `automation/tests/compose_network_isolation_test.sh`
+
 ## What The Current Automation Does
 
 ### Source Cluster
@@ -66,14 +81,15 @@ The source-cluster automation currently:
 
 ### Recovery
 
-The recovery scaffolding currently:
+The recovery tooling currently:
 
 - copies brokers `0`, `1`, and `2` from an immutable snapshot into a disposable scenario work directory
 - captures `quorum-state` metadata and deterministically selects the input `.checkpoint`
 - renders recovery config overlays for the 3-node target
 - deletes copied metadata log state that must not be replayed directly
-- prepares invocation of the snapshot rewrite tool
-- installs the rewritten checkpoint into the copied metadata directories
+- resets copied metadata snapshot directories so stale side files are not replayed
+- invokes the snapshot rewrite tool through the stable `bin/snapshot-rewrite-tool` entrypoint
+- installs the rewritten checkpoint, metadata log, sidecar indexes, `leader-epoch-checkpoint`, and `quorum-state` into the copied metadata directories
 - starts and stops the 3-node recovery cluster from the copied working data
 
 ## What Has Been Verified
@@ -83,64 +99,80 @@ These checks were completed successfully:
 - shell syntax: `bash -n` across the new scripts
 - Python syntax: `python3 -m py_compile` across the Python helpers
 - helper behavior: fixture JSON generation, checkpoint-tool CLI help, and sample deterministic payload generation
+- recovery cleanup helper behavior via `automation/tests/rewrite_cleanup_test.sh`
+- compose network isolation guard via `automation/tests/compose_network_isolation_test.sh`
+- real Scenario 01 recovery boot, assert, and report after:
+  - `automation/recovery/down`
+  - `automation/recovery/rewrite`
+  - `automation/recovery/up`
+  - `automation/scenarios/scenario-01/assert`
+  - `automation/scenarios/scenario-01/report`
 
-These checks were **not** completed yet:
+Important runtime detail:
 
-- actual Docker Compose rendering against a live Docker engine
-- actual source-cluster startup
-- actual fixture seeding against Confluent 8.1 containers
-- actual snapshot capture
-- actual recovery-cluster startup
+- do not reuse a recovery workdir after a failed startup attempt
+- failed boots can contaminate copied metadata state with new epochs
+- the safe retry path is to rerun `prepare` and `rewrite`, or rebuild the scenario run directory, before the next `up`
 
 ## Known Gaps
 
-### Major Missing Piece
+- Scenarios 02 through 08, 10, 11, and 12 are still planned work
+- Scenario 03 still needs an explicit, reproducible fault-injection mechanism
+- Scenario 07 still needs a no-host-dependency transactional probe
+- Scenario 11 and Scenario 12 still need a report bundle convention and normalized diff strategy
+- Scenario 09 remains intentionally deferred until the clean-stop suite is green
 
-- the actual snapshot rewrite binary is still not implemented
-- `automation/recovery/rewrite` expects an executable at `bin/snapshot-rewrite-tool` or `SNAPSHOT_REWRITE_TOOL`
+## Important Fixes Already Landed
 
-### Runtime Risks To Validate First
+- source and recovery Compose stacks no longer pin the same shared Docker network name
+- copied metadata snapshot directories are now cleaned more aggressively before rewritten state is installed
+- stale files such as `leader-epoch-checkpoint`, `quorum-state`, and leftover index files are not preserved in the rewritten metadata snapshot directory
+- rewritten metadata logs now regenerate Kafka `.index` and `.timeindex` sidecars
+- ELR state is now cleared during checkpoint and metadata-log rewrite so recovered controllers do not emit overlapping `ISR`/`ELR` errors
 
-- the Docker engine must allow access to the local Docker socket for `docker compose`
-- the Python package `confluent-kafka` must be installed on the host for transactional fixture seeding
-- `kafka-consumer-groups --reset-offsets` may not be sufficient to materialize the pinned offsets unless the empty groups are first created in a way Confluent 8.1 accepts
-- Kafka CLI names can vary slightly across images, so any command-path mismatch should be fixed from real container output rather than guessed
+These fixes matter because an earlier shared-network setup allowed recovery brokers to resolve source-cluster hostnames and join the wrong Raft peer, which looked like mysterious epoch jumps rather than an obvious wiring failure.
 
 ## First Commands To Run On The New Machine
 
 From repo root:
 
 ```bash
-automation/source-cluster/up
-automation/source-cluster/seed
-automation/source-cluster/validate
-automation/source-cluster/stop
-automation/source-cluster/snapshot baseline-clean-v1
+sed -n '1,220p' AGENTS.md
+sed -n '1,260p' docs/recovery/scenario-implementation-roadmap.md
+sed -n '1,220p' docs/recovery/scenarios/scenario-02-partition-data-integrity.md
 ```
 
-If the source fixture succeeds, the next checkpoint is:
+The latest green Scenario 01 report is:
 
 ```bash
-automation/recovery/prepare scenario-01 baseline-clean-v1
-automation/recovery/rewrite scenario-01 <run-id>
-automation/recovery/up scenario-01 <run-id>
+sed -n '1,220p' docs/recovery/reports/runs/2026-04-21-scenario-01-20260421T084355Z.md
+```
+
+Then resume from the next scenario:
+
+```bash
+automation/recovery/prepare scenario-02 baseline-clean-v1
+automation/recovery/rewrite scenario-02 <run-id>
+automation/recovery/up scenario-02 <run-id>
 ```
 
 `<run-id>` is written into `fixtures/scenario-runs/scenario-01/<run-id>/run.env` by `automation/recovery/prepare`.
 
 ## Recommended Resume Order
 
-1. Verify Docker access from the new machine.
-2. Run the source-cluster smoke path.
-3. Fix any Confluent 8.1 runtime mismatches in the seed and validate scripts.
-4. Capture the first real run artifacts under `fixtures/source-cluster/artifacts/`.
-5. Implement `bin/snapshot-rewrite-tool`.
-6. Run Scenario 01 end to end.
+1. Read `AGENTS.md`.
+2. Read [`scenario-implementation-roadmap.md`](./scenario-implementation-roadmap.md).
+3. Reconcile the scenario file being worked on with the roadmap and the current working tree.
+4. Do the scenario-specific spec pass before code changes.
+5. Implement the smallest failing-test slice.
+6. Only then move to the next scenario in the roadmap order.
 
 ## Main Docs To Read Before Resuming
 
+- [`AGENTS.md`](../../AGENTS.md)
 - `docs/recovery/README.md`
 - `docs/recovery/TODO.md`
+- `docs/recovery/scenario-implementation-roadmap.md`
 - `docs/recovery/harness-spec.md`
 - `docs/recovery/source-fixture-spec.md`
 - `docs/recovery/rewrite-tool-spec.md`
@@ -152,4 +184,3 @@ automation/recovery/up scenario-01 <run-id>
 - current branch: `main`
 - remote: `origin`
 - local `.claude/` contains Claude worktree metadata and should stay out of normal repo commits
-

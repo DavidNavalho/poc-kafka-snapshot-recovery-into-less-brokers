@@ -18,9 +18,13 @@ selected_checkpoint_path="$(jq -r '.path' "${SELECTED_CHECKPOINT_JSON}")"
 selected_checkpoint_basename="$(jq -r '.basename' "${SELECTED_CHECKPOINT_JSON}")"
 dynamic_quorum="$(jq -r '.dynamic_quorum' "${QUORUM_STATE_JSON}")"
 rewritten_checkpoint_path="${WORKDIR}/artifacts/rewrite/${selected_checkpoint_basename}"
+rewritten_metadata_log_path="${WORKDIR}/artifacts/rewrite/00000000000000000000.log"
+rewritten_metadata_index_path="${WORKDIR}/artifacts/rewrite/00000000000000000000.index"
+rewritten_metadata_timeindex_path="${WORKDIR}/artifacts/rewrite/00000000000000000000.timeindex"
 rewrite_report_path="${WORKDIR}/artifacts/rewrite/rewrite-report.json"
 expected_command_path="${WORKDIR}/artifacts/rewrite/rewrite-command.txt"
 tool_path="${SNAPSHOT_REWRITE_TOOL:-${REPO_ROOT}/bin/snapshot-rewrite-tool}"
+source_metadata_log_path=""
 
 if [[ "${dynamic_quorum}" == "true" ]]; then
   rewrite_voters_flag="--rewrite-voters"
@@ -28,10 +32,31 @@ else
   rewrite_voters_flag=""
 fi
 
+write_static_quorum_state() {
+  local output_path="$1"
+  cat >"${output_path}" <<'EOF'
+{"clusterId":"","leaderId":-1,"leaderEpoch":0,"votedId":-1,"appliedOffset":0,"currentVoters":[{"voterId":0},{"voterId":1},{"voterId":2}],"data_version":0}
+EOF
+}
+
+for broker_id in 0 1 2; do
+  candidate_metadata_log_path="${SNAPSHOTS_ROOT}/${SNAPSHOT_LABEL}/brokers/broker-${broker_id}/metadata/__cluster_metadata-0/00000000000000000000.log"
+  [[ -f "${candidate_metadata_log_path}" ]] || fail "source metadata log not found for broker ${broker_id}: ${candidate_metadata_log_path}"
+  if [[ -z "${source_metadata_log_path}" ]]; then
+    source_metadata_log_path="${candidate_metadata_log_path}"
+    continue
+  fi
+  if ! cmp -s "${source_metadata_log_path}" "${candidate_metadata_log_path}"; then
+    fail "surviving source metadata logs differ between brokers; per-broker metadata log rewrite is not implemented"
+  fi
+done
+
 {
   printf '%q ' "${tool_path}" \
     --input "${selected_checkpoint_path}" \
     --output "${rewritten_checkpoint_path}" \
+    --metadata-log-input "${source_metadata_log_path}" \
+    --metadata-log-output "${rewritten_metadata_log_path}" \
     --surviving-brokers "${SURVIVING_BROKERS}" \
     --directory-mode UNASSIGNED \
     --report "${rewrite_report_path}"
@@ -47,6 +72,8 @@ log "rewriting metadata checkpoint ${selected_checkpoint_basename}"
 tool_args=(
   --input "${selected_checkpoint_path}"
   --output "${rewritten_checkpoint_path}"
+  --metadata-log-input "${source_metadata_log_path}"
+  --metadata-log-output "${rewritten_metadata_log_path}"
   --surviving-brokers "${SURVIVING_BROKERS}"
   --directory-mode UNASSIGNED
   --report "${rewrite_report_path}"
@@ -57,9 +84,18 @@ fi
 "${tool_path}" "${tool_args[@]}"
 
 for broker_id in 0 1 2; do
-  metadata_dir="${WORKDIR}/brokers/broker-${broker_id}/metadata"
-  find "${metadata_dir}" -maxdepth 1 -type f -name '*.checkpoint' -delete
+  metadata_dir="$(metadata_snapshot_dir "${WORKDIR}/brokers/broker-${broker_id}/metadata")"
+  source_leader_epoch_checkpoint_path="${SNAPSHOTS_ROOT}/${SNAPSHOT_LABEL}/brokers/broker-${broker_id}/metadata/${METADATA_SNAPSHOT_SUBDIR}/leader-epoch-checkpoint"
+  reset_metadata_snapshot_dir "${metadata_dir}"
   cp "${rewritten_checkpoint_path}" "${metadata_dir}/${selected_checkpoint_basename}"
+  cp "${rewritten_metadata_log_path}" "${metadata_dir}/00000000000000000000.log"
+  cp "${rewritten_metadata_index_path}" "${metadata_dir}/00000000000000000000.index"
+  cp "${rewritten_metadata_timeindex_path}" "${metadata_dir}/00000000000000000000.timeindex"
+  cp "${source_leader_epoch_checkpoint_path}" "${metadata_dir}/leader-epoch-checkpoint"
+  if [[ "${dynamic_quorum}" == "true" ]]; then
+    fail "dynamic quorum quorum-state rewrite is not implemented"
+  fi
+  write_static_quorum_state "${metadata_dir}/quorum-state"
 done
 
-log "rewritten checkpoint installed into recovery broker metadata directories"
+log "rewritten checkpoint, metadata log, sidecar indexes, leader epoch checkpoint, and quorum state installed into recovery broker metadata directories"

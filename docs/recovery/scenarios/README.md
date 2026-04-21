@@ -2,11 +2,15 @@
 
 Each file in this directory defines one scenario in a spec-first format.
 
+The authoritative current implementation order and real status live in
+[../scenario-implementation-roadmap.md](../scenario-implementation-roadmap.md).
+Use this file as the scenario catalog; use the roadmap as the active execution plan.
+
 ## Execution Order
 
 | ID | File | Purpose | Phase | Status |
 |---|---|---|---|---|
-| 01 | [scenario-01-quorum-and-metadata.md](./scenario-01-quorum-and-metadata.md) | Prove the rewritten metadata boots as a 3-node KRaft cluster | 1 | Planned |
+| 01 | [scenario-01-quorum-and-metadata.md](./scenario-01-quorum-and-metadata.md) | Prove the rewritten metadata boots as a 3-node KRaft cluster | 1 | Implemented |
 | 02 | [scenario-02-partition-data-integrity.md](./scenario-02-partition-data-integrity.md) | Prove copied partition data is readable and offsets match the source manifest | 1 | Planned |
 | 03 | [scenario-03-stray-detection-safety-net.md](./scenario-03-stray-detection-safety-net.md) | Prove stray detection is avoided in the happy path and recoverable in a fault-injected case | 1 | Planned |
 | 04 | [scenario-04-consumer-offset-continuity.md](./scenario-04-consumer-offset-continuity.md) | Prove consumer groups resume from inherited offsets | 1 | Planned |

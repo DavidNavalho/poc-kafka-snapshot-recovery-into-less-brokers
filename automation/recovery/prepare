@@ -4,8 +4,8 @@ set -euo pipefail
 
 source "$(cd "$(dirname "$0")/.." && pwd -P)/lib/common.sh"
 
+require_cmd docker
 require_cmd jq
-require_cmd python3
 
 scenario_id="${1:-}"
 snapshot_label="${2:-baseline-clean-v1}"
@@ -28,15 +28,22 @@ ensure_dir "${workdir}/artifacts/recovery"
 for broker_id in 0 1 2; do
   log "copying snapshot broker ${broker_id} into ${workdir}"
   copy_tree "${snapshot_dir}/brokers/broker-${broker_id}" "${workdir}/brokers/broker-${broker_id}"
+  ensure_dir "${workdir}/brokers/broker-${broker_id}/data-root"
 done
 
-quorum_state_json "${workdir}/brokers/broker-0/metadata/quorum-state" >"${workdir}/artifacts/prepare/quorum-state.json"
+quorum_state_json "$(metadata_snapshot_dir "${workdir}/brokers/broker-0/metadata")/quorum-state" >"${workdir}/artifacts/prepare/quorum-state.json"
 checkpoint_json_for_root "${workdir}/brokers" >"${workdir}/artifacts/prepare/selected-checkpoint.json"
 render_recovery_configs "${workdir}"
 
 for broker_id in 0 1 2; do
-  find "${workdir}/brokers/broker-${broker_id}/metadata" \
-    \( -name 'quorum-state' -o -name '*.log' -o -name '*.checkpoint.part' -o -name '*.checkpoint.deleted' \) \
+  find "$(metadata_snapshot_dir "${workdir}/brokers/broker-${broker_id}/metadata")" \
+    \( -name 'quorum-state' \
+      -o -name '*.log' \
+      -o -name '*.index' \
+      -o -name '*.timeindex' \
+      -o -name '*.snapshot' \
+      -o -name '*.checkpoint.part' \
+      -o -name '*.checkpoint.deleted' \) \
     -type f -delete
 done
 

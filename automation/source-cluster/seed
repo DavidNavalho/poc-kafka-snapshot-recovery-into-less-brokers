@@ -6,7 +6,6 @@ source "$(cd "$(dirname "$0")/.." && pwd -P)/lib/common.sh"
 
 require_cmd docker
 require_cmd jq
-require_cmd python3
 
 wait_for_source_cluster
 
@@ -19,7 +18,7 @@ fixture_json_file="${artifact_dir}/fixture.json"
 ensure_dir "${artifact_dir}"
 ensure_dir "${open_txn_dir}"
 
-python3 "${REPO_ROOT}/automation/lib/source_fixture.py" fixture-json >"${fixture_json_file}"
+toolbox_python "${REPO_ROOT}/automation/lib/source_fixture.py" fixture-json >"${fixture_json_file}"
 fixture_json="$(cat "${fixture_json_file}")"
 
 create_topic() {
@@ -44,38 +43,25 @@ create_topic() {
     args+=(--config "${config_entry}")
   done < <(jq -r '.configs | to_entries[]? | "\(.key)=\(.value)"' <<<"${topic_json}")
   log "creating topic ${name}"
-  source_compose "${args[@]}"
+  source_compose "${args[@]}" </dev/null
 }
 
 produce_fixed_topic() {
   local topic_json="$1"
   local name partitions payload_bytes count
   local partition
-  local -a producer_args
   name="$(jq -r '.name' <<<"${topic_json}")"
   partitions="$(jq -r '.partitions' <<<"${topic_json}")"
   payload_bytes="$(jq -r '.payload_bytes' <<<"${topic_json}")"
   count="$(jq -r '.seed_plan.messages_per_partition' <<<"${topic_json}")"
   for partition in $(seq 0 $((partitions - 1))); do
-    producer_args=(
-      exec -T kafka-0
-      kafka-console-producer
-      --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}"
-      --topic "${name}"
-      --partition "${partition}"
-      --producer-property acks=all
-    )
-    if [[ "${name}" == "recovery.compressed.zstd" ]]; then
-      producer_args+=(--producer-property compression.type=zstd)
-      producer_args+=(--producer-property max.request.size=10485760)
-    fi
     log "producing ${count} records to ${name} partition ${partition}"
-    python3 "${REPO_ROOT}/automation/lib/generate_fixture_records.py" fixed \
+    toolbox_python "${REPO_ROOT}/automation/lib/seed_plain_records.py" fixed \
+      --bootstrap-server kafka-0:9092 \
       --topic "${name}" \
       --partition "${partition}" \
       --count "${count}" \
-      --payload-bytes "${payload_bytes}" \
-      | source_compose "${producer_args[@]}"
+      --payload-bytes "${payload_bytes}"
   done
 }
 
@@ -91,21 +77,14 @@ produce_compacted_topic() {
   versions_per_key="$(jq -r '.seed_plan.versions_per_key' <<<"${topic_json}")"
   for partition in $(seq 0 $((partitions - 1))); do
     log "producing compacted records to ${name} partition ${partition}"
-    python3 "${REPO_ROOT}/automation/lib/generate_fixture_records.py" compacted \
+    toolbox_python "${REPO_ROOT}/automation/lib/seed_plain_records.py" compacted \
+      --bootstrap-server kafka-0:9092 \
       --topic "${name}" \
       --partition "${partition}" \
       --key-prefix "${key_prefix}" \
       --keys-per-partition "${keys_per_partition}" \
       --versions-per-key "${versions_per_key}" \
-      --payload-bytes "${payload_bytes}" \
-      | source_compose exec -T kafka-0 \
-          kafka-console-producer \
-          --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" \
-          --topic "${name}" \
-          --partition "${partition}" \
-          --property parse.key=true \
-          --property key.separator=$'\t' \
-          --producer-property acks=all
+      --payload-bytes "${payload_bytes}"
   done
 }
 
@@ -127,8 +106,8 @@ seed_transactions() {
   touch "${hold_file}"
 
   log "producing committed transactions for ${topic}"
-  python3 "${REPO_ROOT}/automation/lib/seed_transactions.py" committed \
-    --bootstrap-server localhost:19092 \
+  toolbox_python "${REPO_ROOT}/automation/lib/seed_transactions.py" committed \
+    --bootstrap-server kafka-0:9092 \
     --topic "${topic}" \
     --partitions "${partitions}" \
     --payload-bytes "${payload_bytes}" \
@@ -137,8 +116,8 @@ seed_transactions() {
     >"${artifact_dir}/transactions-committed.log" 2>&1
 
   log "opening in-flight transaction for ${topic}"
-  python3 "${REPO_ROOT}/automation/lib/seed_transactions.py" open \
-    --bootstrap-server localhost:19092 \
+  toolbox_python "${REPO_ROOT}/automation/lib/seed_transactions.py" open \
+    --bootstrap-server kafka-0:9092 \
     --topic "${topic}" \
     --partitions "${partitions}" \
     --payload-bytes "${payload_bytes}" \
@@ -161,33 +140,12 @@ create_consumer_groups() {
     topic="$(jq -r '.topic' <<<"${group_json}")"
     offset="$(jq -r '.expected_committed_offsets["0"]' <<<"${group_json}")"
     log "setting consumer group ${group_id} offsets to ${offset} for ${topic}"
-    source_compose exec -T kafka-0 \
-      kafka-consumer-groups \
-      --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" \
-      --group "${group_id}" \
+    toolbox_python "${REPO_ROOT}/automation/lib/seed_consumer_group_offsets.py" commit \
+      --bootstrap-server kafka-0:9092 \
+      --group-id "${group_id}" \
       --topic "${topic}" \
-      --reset-offsets \
-      --to-offset "${offset}" \
-      --execute
+      --offset "${offset}"
   done < <(jq -c '.consumer_groups[]' <<<"${fixture_json}")
-}
-
-apply_broker_overrides() {
-  while IFS= read -r broker_json; do
-    local broker_id
-    broker_id="$(jq -r '.broker_id' <<<"${broker_json}")"
-    while IFS= read -r config_entry; do
-      [[ -n "${config_entry}" ]] || continue
-      log "applying dynamic broker config ${config_entry} to broker ${broker_id}"
-      source_compose exec -T kafka-0 \
-        kafka-configs \
-        --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" \
-        --entity-type brokers \
-        --entity-name "${broker_id}" \
-        --alter \
-        --add-config "${config_entry}"
-    done < <(jq -r '.configs | to_entries[] | "\(.key)=\(.value)"' <<<"${broker_json}")
-  done < <(jq -c '.broker_dynamic_configs[]' <<<"${fixture_json}")
 }
 
 while IFS= read -r topic_json; do
@@ -213,7 +171,6 @@ while IFS= read -r topic_json; do
 done < <(jq -c '.topics[]' <<<"${fixture_json}")
 
 create_consumer_groups
-apply_broker_overrides
 
 log "source fixture seeded; artifact directory: ${artifact_dir}"
 log "open transaction helper state directory: ${open_txn_dir}"

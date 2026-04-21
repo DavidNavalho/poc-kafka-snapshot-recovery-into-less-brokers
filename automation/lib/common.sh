@@ -10,8 +10,11 @@ readonly SOURCE_ARTIFACTS_ROOT="${FIXTURES_ROOT}/source-cluster/artifacts"
 readonly SNAPSHOTS_ROOT="${FIXTURES_ROOT}/snapshots"
 readonly SCENARIO_RUNS_ROOT="${FIXTURES_ROOT}/scenario-runs"
 readonly REPORT_RUNS_ROOT="${DOCS_ROOT}/reports/runs"
+readonly METADATA_SNAPSHOT_SUBDIR="__cluster_metadata-0"
 
 readonly KAFKA_IMAGE="${KAFKA_IMAGE:-confluentinc/cp-kafka:8.1.0}"
+readonly TOOLBOX_IMAGE="${TOOLBOX_IMAGE:-recovery-harness-toolbox:latest}"
+readonly TOOLBOX_DOCKERFILE="${TOOLBOX_DOCKERFILE:-${REPO_ROOT}/tooling/python-toolbox.Dockerfile}"
 readonly KAFKA_CLUSTER_ID="${KAFKA_CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qk}"
 readonly HARNESS_NETWORK="${HARNESS_NETWORK:-recovery-harness}"
 readonly SOURCE_PROJECT="${SOURCE_PROJECT:-source-cluster}"
@@ -71,6 +74,7 @@ prepare_source_dirs() {
     ensure_dir "$(source_broker_dir "${broker_id}")/metadata"
     ensure_dir "$(source_broker_dir "${broker_id}")/logdir-0"
     ensure_dir "$(source_broker_dir "${broker_id}")/logdir-1"
+    ensure_dir "$(source_broker_dir "${broker_id}")/data-root"
     ensure_dir "$(source_broker_dir "${broker_id}")/rendered-config"
   done
 }
@@ -109,7 +113,7 @@ wait_for_source_cluster() {
   local sleep_seconds="${2:-2}"
   local attempt
   for attempt in $(seq 1 "${attempts}"); do
-    if source_compose exec -T kafka-0 kafka-topics --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" --list >/dev/null 2>&1; then
+    if source_compose exec -T kafka-0 kafka-topics --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" --list </dev/null >/dev/null 2>&1; then
       return 0
     fi
     sleep "${sleep_seconds}"
@@ -124,7 +128,7 @@ wait_for_recovery_cluster() {
   local sleep_seconds="${3:-2}"
   local attempt
   for attempt in $(seq 1 "${attempts}"); do
-    if recovery_compose "${project_name}" exec -T kafka-0 kafka-topics --bootstrap-server kafka-0:9092 --list >/dev/null 2>&1; then
+    if recovery_compose "${project_name}" exec -T kafka-0 kafka-topics --bootstrap-server kafka-0:9092 --list </dev/null >/dev/null 2>&1; then
       return 0
     fi
     sleep "${sleep_seconds}"
@@ -143,7 +147,7 @@ source_topic_offsets() {
     else
       kafka-run-class kafka.tools.GetOffsetShell --bootstrap-server ${SOURCE_BOOTSTRAP_SERVER} --topic '${topic_name}'
     fi
-  "
+  " </dev/null
 }
 
 
@@ -174,6 +178,7 @@ render_server_properties() {
   local log_dir_0="${13}"
   local log_dir_1="${14}"
   local topic_auto_create="${15}"
+  local file_delete_delay_ms="${16:-}"
   ensure_dir "$(dirname "${output_path}")"
   cat >"${output_path}" <<EOF
 # Rendered ${mode} broker config for recovery harness visibility.
@@ -198,6 +203,9 @@ transaction.state.log.min.isr=${txn_min_isr}
 group.initial.rebalance.delay.ms=0
 delete.topic.enable=true
 EOF
+  if [[ -n "${file_delete_delay_ms}" ]]; then
+    printf 'file.delete.delay.ms=%s\n' "${file_delete_delay_ms}" >>"${output_path}"
+  fi
 }
 
 
@@ -219,7 +227,11 @@ render_source_configs() {
       "/var/lib/kafka/metadata" \
       "/var/lib/kafka/data-0" \
       "/var/lib/kafka/data-1" \
-      "false"
+      "false" \
+      ""
+    if [[ "${broker_id}" == "0" ]]; then
+      printf 'log.retention.hours=48\n' >>"$(source_broker_dir "${broker_id}")/rendered-config/server.properties"
+    fi
   done
 }
 
@@ -243,20 +255,60 @@ render_recovery_configs() {
       "/var/lib/kafka/metadata" \
       "/var/lib/kafka/data-0" \
       "/var/lib/kafka/data-1" \
-      "false"
+      "false" \
+      "86400000"
   done
 }
 
 
 checkpoint_json_for_root() {
   local search_root="$1"
-  python3 "${REPO_ROOT}/automation/lib/checkpoint_tool.py" select --search-root "${search_root}"
+  toolbox_python "${REPO_ROOT}/automation/lib/checkpoint_tool.py" select --search-root "${search_root}"
 }
 
 
 quorum_state_json() {
   local quorum_state_path="$1"
-  python3 "${REPO_ROOT}/automation/lib/checkpoint_tool.py" quorum-state --path "${quorum_state_path}"
+  toolbox_python "${REPO_ROOT}/automation/lib/checkpoint_tool.py" quorum-state --path "${quorum_state_path}"
+}
+
+
+metadata_snapshot_dir() {
+  local metadata_root="$1"
+  printf '%s/%s' "${metadata_root}" "${METADATA_SNAPSHOT_SUBDIR}"
+}
+
+
+reset_metadata_snapshot_dir() {
+  local metadata_dir="$1"
+  [[ -d "${metadata_dir}" ]] || fail "metadata snapshot directory does not exist: ${metadata_dir}"
+  find "${metadata_dir}" -maxdepth 1 -type f ! -name 'partition.metadata' -delete
+}
+
+
+ensure_toolbox_image() {
+  if docker image inspect "${TOOLBOX_IMAGE}" >/dev/null 2>&1; then
+    return 0
+  fi
+  printf '[%s] %s\n' "$(timestamp_utc)" "building toolbox image ${TOOLBOX_IMAGE}" >&2
+  docker build -t "${TOOLBOX_IMAGE}" -f "${TOOLBOX_DOCKERFILE}" "${REPO_ROOT}" >&2
+}
+
+
+toolbox_python() {
+  local -a docker_args
+  ensure_toolbox_image
+  docker_args=(
+    run
+    --rm
+    --user "$(id -u):$(id -g)"
+    -v "${REPO_ROOT}:${REPO_ROOT}"
+    -w "${REPO_ROOT}"
+  )
+  if docker network inspect "${HARNESS_NETWORK}" >/dev/null 2>&1; then
+    docker_args+=(--network "${HARNESS_NETWORK}")
+  fi
+  docker "${docker_args[@]}" "${TOOLBOX_IMAGE}" python3 "$@"
 }
 
 

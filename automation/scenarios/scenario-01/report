@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+require_cmd docker
+require_cmd jq
+
+scenario_id="scenario-01"
+run_id="${1:-}"
+
+[[ -n "${run_id}" ]] || fail "usage: automation/scenarios/scenario-01/report <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+
+summary_path="${WORKDIR}/artifacts/assert/assert-summary.json"
+snapshot_manifest_path="${WORKDIR}/snapshot-manifest.json"
+report_date="$(date -u +%F)"
+report_path="${REPORT_RUNS_ROOT}/${report_date}-scenario-01-${run_id}.md"
+startup_failure_scan_path="${WORKDIR}/artifacts/assert/startup-failure-scan.txt"
+secondary_anomalies_path="${WORKDIR}/artifacts/assert/secondary-anomalies.txt"
+recovery_image="$(jq -r '.image.vendor + "/" + .image.product + ":" + .image.tag' "${snapshot_manifest_path}")"
+source_fixture_version="$(jq -r '.source_fixture_version // "unknown"' "${snapshot_manifest_path}")"
+summary_status="$(jq -r '.status // "fail"' "${summary_path}")"
+docker_server_version="$(docker version --format '{{.Server.Version}}' 2>/dev/null || printf 'unknown')"
+docker_compose_version="$(docker compose version --short 2>/dev/null || printf 'unknown')"
+host_machine="$(hostname)"
+
+case "${summary_status}" in
+  pass) result_label="PASS" ;;
+  fail) result_label="FAIL" ;;
+  *) result_label="PARTIAL" ;;
+esac
+
+assertions_table="$(
+  jq -r '.assertions[] | [.name, .result, .evidence] | @tsv' "${summary_path}" | while IFS=$'\t' read -r name result evidence; do
+    printf '| %s | %s | `%s` |\n' "${name}" "${result}" "${evidence}"
+  done
+)"
+
+findings_block="- none"
+has_secondary_anomalies="false"
+if [[ -s "${startup_failure_scan_path}" ]] && ! grep -q '^no startup failure patterns detected$' "${startup_failure_scan_path}"; then
+  findings_block="$(while IFS= read -r line; do printf -- '- %s\n' "${line}"; done <"${startup_failure_scan_path}")"
+elif [[ -s "${secondary_anomalies_path}" ]] && ! grep -q '^no secondary anomalies detected$' "${secondary_anomalies_path}"; then
+  has_secondary_anomalies="true"
+  findings_block="$(while IFS= read -r line; do printf -- '- %s\n' "${line}"; done <"${secondary_anomalies_path}")"
+fi
+
+follow_up_block="- Investigate the failing assertions and recovery logs before proceeding."
+if [[ "${summary_status}" == "pass" ]]; then
+  if [[ "${has_secondary_anomalies}" == "true" ]]; then
+    follow_up_block="- Proceed to Scenario 02 once the secondary anomalies are either explained or retired."
+  else
+    follow_up_block="- Proceed to Scenario 02."
+  fi
+fi
+
+ensure_dir "${REPORT_RUNS_ROOT}"
+
+cat >"${report_path}" <<EOF
+# Scenario 01 Report
+
+## Summary
+
+- Scenario: scenario-01
+- Run ID: ${run_id}
+- Date: ${report_date}
+- Snapshot label: ${SNAPSHOT_LABEL}
+- Source fixture revision: ${source_fixture_version}
+- Recovery image version: ${recovery_image}
+- Result: ${result_label}
+
+## Environment
+
+- Host machine: ${host_machine}
+- Docker version: ${docker_server_version}
+- Compose version: ${docker_compose_version}
+- Relevant resource notes: scenario report generated from ${WORKDIR}
+
+## Procedure
+
+1. \`automation/recovery/prepare scenario-01 ${SNAPSHOT_LABEL} ${run_id}\`
+2. \`automation/recovery/rewrite scenario-01 ${run_id}\`
+3. \`automation/recovery/up scenario-01 ${run_id}\`
+4. \`automation/scenarios/scenario-01/assert ${run_id}\`
+5. \`automation/scenarios/scenario-01/report ${run_id}\`
+
+## Assertions
+
+| Assertion | Result | Evidence |
+|---|---|---|
+${assertions_table}
+
+## Artifacts
+
+- Broker logs: \`${WORKDIR}/artifacts/recovery/docker-compose.log\`
+- Metadata dump: \`${WORKDIR}/artifacts/rewrite/rewrite-report.json\`
+- Topic descriptions: \`${WORKDIR}/artifacts/assert/topics/\`
+- Consumer group outputs: not collected in Scenario 01
+- Other: \`${WORKDIR}/artifacts/assert/quorum-status.txt\`, \`${WORKDIR}/artifacts/assert/secondary-anomalies.txt\`
+
+## Findings
+
+${findings_block}
+
+## Follow-Up
+
+${follow_up_block}
+EOF
+
+log "scenario 01 report written to ${report_path}"

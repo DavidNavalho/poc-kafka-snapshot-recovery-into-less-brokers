@@ -34,6 +34,8 @@ Prove feasibility with a deterministic, resource-conscious harness:
 - [Harness Spec](./harness-spec.md)
 - [Source Fixture Spec](./source-fixture-spec.md)
 - [Snapshot Rewrite Tool Spec](./rewrite-tool-spec.md)
+- [Snapshot Rewrite Tool Implementation Draft](./rewrite-tool-implementation-plan.md)
+- [Scenario Implementation Roadmap](./scenario-implementation-roadmap.md)
 - [Handoff](./HANDOFF.md)
 - [Scenario Index](./scenarios/README.md)
 - [Manual Runbooks](./manual-runbooks/README.md)
