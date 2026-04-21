@@ -61,6 +61,7 @@ final class CheckpointRewriteEngine {
         int leaderPreserved = 0;
         int leaderReassigned = 0;
         int missingSurvivors = 0;
+        boolean partitionReplicaOverrideApplied = false;
 
         for (ApiMessageAndVersion record : inputSnapshot.records()) {
             incrementCount(recordCounts, record.message().getClass().getSimpleName());
@@ -81,16 +82,22 @@ final class CheckpointRewriteEngine {
 
             if (record.message() instanceof PartitionRecord partitionRecord) {
                 partitionTotal++;
+                String topicName = topicNamesById.getOrDefault(partitionRecord.topicId(), partitionRecord.topicId().toString());
+                Optional<PartitionReplicaOverride> partitionReplicaOverride = matchingPartitionReplicaOverride(
+                    options.partitionReplicaOverride(),
+                    topicName,
+                    partitionRecord.partitionId()
+                );
                 List<Integer> survivingReplicas = partitionRecord.replicas()
                     .stream()
                     .filter(survivingSet::contains)
                     .toList();
 
-                if (survivingReplicas.isEmpty()) {
+                if (survivingReplicas.isEmpty() && partitionReplicaOverride.isEmpty()) {
                     missingSurvivors++;
                     missingPartitions.add(
                         new RewriteReport.MissingPartition(
-                            topicNamesById.getOrDefault(partitionRecord.topicId(), partitionRecord.topicId().toString()),
+                            topicName,
                             partitionRecord.partitionId(),
                             partitionRecord.replicas(),
                             List.of()
@@ -99,8 +106,12 @@ final class CheckpointRewriteEngine {
                     continue;
                 }
 
-                boolean preserveLeader = survivingSet.contains(partitionRecord.leader());
-                int rewrittenLeader = preserveLeader ? partitionRecord.leader() : survivingReplicas.getFirst();
+                boolean preserveLeader = partitionReplicaOverride
+                    .map(override -> override.leaderId() == partitionRecord.leader())
+                    .orElseGet(() -> survivingSet.contains(partitionRecord.leader()));
+                int rewrittenLeader = partitionReplicaOverride
+                    .map(PartitionReplicaOverride::leaderId)
+                    .orElseGet(() -> preserveLeader ? partitionRecord.leader() : survivingReplicas.getFirst());
                 PartitionRecord rewrittenPartition = partitionRecord.duplicate()
                     .setReplicas(survivingReplicas)
                     .setIsr(survivingReplicas)
@@ -112,6 +123,10 @@ final class CheckpointRewriteEngine {
                     .setDirectories(List.of(DirectoryId.unassignedArray(survivingReplicas.size())))
                     .setEligibleLeaderReplicas(List.of())
                     .setLastKnownElr(List.of());
+                if (partitionReplicaOverride.isPresent()) {
+                    rewrittenPartition = applyPartitionReplicaOverride(rewrittenPartition, partitionReplicaOverride.orElseThrow());
+                    partitionReplicaOverrideApplied = true;
+                }
                 rewrittenRecords.add(new ApiMessageAndVersion(rewrittenPartition, record.version()));
                 partitionRewritten++;
                 if (preserveLeader) {
@@ -146,6 +161,19 @@ final class CheckpointRewriteEngine {
             options.rewriteVoters(),
             votersRewritten
         );
+
+        if (options.partitionReplicaOverride().isPresent() && !partitionReplicaOverrideApplied) {
+            PartitionReplicaOverride partitionReplicaOverride = options.partitionReplicaOverride().orElseThrow();
+            throw new RewriteAbortException(
+                "fault override target not found in checkpoint: " +
+                    partitionReplicaOverride.topicName() + "-" + partitionReplicaOverride.partitionId(),
+                quorumReport,
+                new RewriteReport.RecordsProcessed(totalRecords, recordCounts),
+                partitionSummary,
+                List.of(),
+                List.copyOf(warnings)
+            );
+        }
 
         if (!missingPartitions.isEmpty()) {
             throw new RewriteAbortException(
@@ -225,6 +253,26 @@ final class CheckpointRewriteEngine {
         }
 
         return VoterSet.fromMap(filteredVoters);
+    }
+
+    private Optional<PartitionReplicaOverride> matchingPartitionReplicaOverride(
+        Optional<PartitionReplicaOverride> partitionReplicaOverride,
+        String topicName,
+        int partitionId
+    ) {
+        return partitionReplicaOverride.filter(override -> override.matches(topicName, partitionId));
+    }
+
+    private PartitionRecord applyPartitionReplicaOverride(PartitionRecord rewrittenPartition, PartitionReplicaOverride partitionReplicaOverride) {
+        return rewrittenPartition
+            .setReplicas(partitionReplicaOverride.replicas())
+            .setIsr(partitionReplicaOverride.replicas())
+            .setRemovingReplicas(List.of())
+            .setAddingReplicas(List.of())
+            .setLeader(partitionReplicaOverride.leaderId())
+            .setDirectories(List.of(DirectoryId.unassignedArray(partitionReplicaOverride.replicas().size())))
+            .setEligibleLeaderReplicas(List.of())
+            .setLastKnownElr(List.of());
     }
 
     private KRaftVersion effectiveKRaftVersion(KRaftVersion inputVersion, Optional<VoterSet> outputVoterSet) {

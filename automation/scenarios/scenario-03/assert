@@ -1,0 +1,443 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+require_cmd docker
+require_cmd jq
+require_cmd rg
+
+scenario_id="scenario-03"
+run_id="${1:-}"
+
+[[ -n "${run_id}" ]] || fail "usage: automation/scenarios/scenario-03/assert <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+export RECOVERY_WORKDIR="${WORKDIR}"
+
+assert_dir="${WORKDIR}/artifacts/assert"
+positive_dir="${assert_dir}/positive"
+negative_dir="${assert_dir}/negative"
+restored_dir="${assert_dir}/restored"
+negative_workdir="${WORKDIR}/artifacts/negative/workdir"
+negative_rewrite_dir="${negative_dir}/rewrite"
+negative_project="$(sanitize_project_name "${RECOVERY_PROJECT}-negative")"
+assertions_jsonl_path="${assert_dir}/assertions.jsonl"
+summary_path="${assert_dir}/assert-summary.json"
+snapshot_manifest_path="${WORKDIR}/snapshot-manifest.json"
+selected_checkpoint_basename="$(jq -r '.basename // empty' "${SELECTED_CHECKPOINT_JSON}")"
+expected_latest_offset="$(jq -r '.topics[] | select(.name == "recovery.default.6p") | .expected_latest_offsets["0"] // empty' "${snapshot_manifest_path}")"
+
+readonly TARGET_TOPIC="recovery.default.6p"
+readonly TARGET_PARTITION="0"
+readonly TARGET_BROKER_ID="0"
+readonly TARGET_LOGDIR_NAME="logdir-0"
+readonly TARGET_RELATIVE_DIR="brokers/broker-0/logdir-0/recovery.default.6p-0"
+readonly READY_WAIT_ATTEMPTS="${SCENARIO03_READY_WAIT_ATTEMPTS:-60}"
+readonly READY_WAIT_SECONDS="${SCENARIO03_READY_WAIT_SECONDS:-1}"
+readonly STRAY_WAIT_ATTEMPTS="${SCENARIO03_STRAY_WAIT_ATTEMPTS:-45}"
+readonly STRAY_WAIT_SECONDS="${SCENARIO03_STRAY_WAIT_SECONDS:-1}"
+readonly STARTUP_FAILURE_PATTERN='stray|-stray'
+
+ensure_dir "${positive_dir}"
+ensure_dir "${negative_dir}"
+ensure_dir "${negative_rewrite_dir}"
+ensure_dir "${restored_dir}/topics"
+ensure_dir "${restored_dir}/samples"
+: >"${assertions_jsonl_path}"
+
+had_failure=0
+
+record_assertion() {
+  local id="$1"
+  local name="$2"
+  local result="$3"
+  local evidence="$4"
+  local details="$5"
+
+  if [[ "${result}" != "PASS" ]]; then
+    had_failure=1
+  fi
+
+  jq -nc \
+    --arg id "${id}" \
+    --arg name "${name}" \
+    --arg result "${result}" \
+    --arg evidence "${evidence}" \
+    --arg details "${details}" \
+    '{id: $id, name: $name, result: $result, evidence: $evidence, details: $details}' >>"${assertions_jsonl_path}"
+}
+
+write_scan_output() {
+  local source_path="$1"
+  local pattern="$2"
+  local output_path="$3"
+  local empty_message="$4"
+
+  if [[ ! -f "${source_path}" ]]; then
+    printf 'source file missing: %s\n' "${source_path}" >"${output_path}"
+    return 2
+  fi
+
+  if rg -ni --no-heading --color never "${pattern}" "${source_path}" >"${output_path}"; then
+    return 0
+  fi
+
+  printf '%s\n' "${empty_message}" >"${output_path}"
+  return 1
+}
+
+capture_recovery_state() {
+  local project_name="$1"
+  local workdir_root="$2"
+  local log_path="$3"
+  local ps_path="$4"
+
+  RECOVERY_WORKDIR="${workdir_root}" recovery_compose "${project_name}" logs --no-color >"${log_path}" || true
+  RECOVERY_WORKDIR="${workdir_root}" recovery_compose "${project_name}" ps >"${ps_path}" || true
+}
+
+list_directory_names() {
+  local root_dir="$1"
+  local output_path="$2"
+
+  if [[ ! -d "${root_dir}" ]]; then
+    printf 'directory missing: %s\n' "${root_dir}" >"${output_path}"
+    return 1
+  fi
+
+  find "${root_dir}" -maxdepth 1 -mindepth 1 -type d | sed 's#^.*/##' | sort >"${output_path}"
+}
+
+scan_stray_dirs() {
+  local workdir_root="$1"
+  local output_path="$2"
+
+  find "${workdir_root}/brokers" -type d -name '*-stray' | sort >"${output_path}.tmp" || true
+  if [[ -s "${output_path}.tmp" ]]; then
+    mv "${output_path}.tmp" "${output_path}"
+    return 0
+  fi
+
+  printf 'no stray directories detected\n' >"${output_path}"
+  rm -f "${output_path}.tmp"
+  return 1
+}
+
+wait_for_project_ready() {
+  local project_name="$1"
+  local workdir_root="$2"
+  local attempts="${3:-90}"
+  local sleep_seconds="${4:-2}"
+  local attempt
+
+  export RECOVERY_WORKDIR="${workdir_root}"
+  for attempt in $(seq 1 "${attempts}"); do
+    if recovery_compose "${project_name}" exec -T kafka-0 kafka-topics --bootstrap-server kafka-0:9092 --list </dev/null >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "${sleep_seconds}"
+  done
+  return 1
+}
+
+wait_for_target_stray() {
+  local workdir_root="$1"
+  local attempt
+
+  for attempt in $(seq 1 "${STRAY_WAIT_ATTEMPTS}"); do
+    if [[ -n "$(find_target_stray_dir "${workdir_root}")" ]]; then
+      return 0
+    fi
+    sleep "${STRAY_WAIT_SECONDS}"
+  done
+  return 1
+}
+
+find_target_stray_dir() {
+  local workdir_root="$1"
+  find "${workdir_root}/brokers/broker-${TARGET_BROKER_ID}/${TARGET_LOGDIR_NAME}" -maxdepth 1 -mindepth 1 -type d \
+    -name "${TARGET_TOPIC}-${TARGET_PARTITION}*-stray" | sort | head -n 1
+}
+
+install_metadata_artifacts() {
+  local checkpoint_path="$1"
+  local log_path="$2"
+  local workdir_root="$3"
+  local broker_id metadata_dir
+
+  for broker_id in 0 1 2; do
+    metadata_dir="$(metadata_snapshot_dir "${workdir_root}/brokers/broker-${broker_id}/metadata")"
+    cp "${checkpoint_path}" "${metadata_dir}/${selected_checkpoint_basename}"
+    cp "${log_path}" "${metadata_dir}/00000000000000000000.log"
+    cp "${log_path%.log}.index" "${metadata_dir}/00000000000000000000.index"
+    cp "${log_path%.log}.timeindex" "${metadata_dir}/00000000000000000000.timeindex"
+  done
+}
+
+capture_quorum_status() {
+  local project_name="$1"
+  local workdir_root="$2"
+  local output_path="$3"
+
+  export RECOVERY_WORKDIR="${workdir_root}"
+  recovery_compose "${project_name}" exec -T kafka-0 \
+    kafka-metadata-quorum --bootstrap-server kafka-0:9092 describe --status </dev/null >"${output_path}"
+}
+
+capture_topic_describe() {
+  local project_name="$1"
+  local workdir_root="$2"
+  local output_path="$3"
+
+  export RECOVERY_WORKDIR="${workdir_root}"
+  recovery_compose "${project_name}" exec -T kafka-0 \
+    kafka-topics --bootstrap-server kafka-0:9092 --describe --topic "${TARGET_TOPIC}" </dev/null >"${output_path}"
+}
+
+capture_topic_unavailable() {
+  local project_name="$1"
+  local workdir_root="$2"
+  local output_path="$3"
+
+  export RECOVERY_WORKDIR="${workdir_root}"
+  recovery_compose "${project_name}" exec -T kafka-0 \
+    kafka-topics --bootstrap-server kafka-0:9092 --describe --topic "${TARGET_TOPIC}" --unavailable-partitions </dev/null >"${output_path}"
+}
+
+capture_partition_count() {
+  local project_name="$1"
+  local workdir_root="$2"
+  local output_path="$3"
+
+  export RECOVERY_WORKDIR="${workdir_root}"
+  recovery_compose "${project_name}" exec -T kafka-0 bash -lc "
+    kafka-console-consumer \
+      --bootstrap-server kafka-0:9092 \
+      --topic '${TARGET_TOPIC}' \
+      --partition ${TARGET_PARTITION} \
+      --from-beginning \
+      --timeout-ms 20000 2>/dev/null | wc -l
+  " </dev/null | tr -d '[:space:]' >"${output_path}"
+}
+
+positive_log_path="${positive_dir}/recovery.log"
+positive_ps_path="${positive_dir}/recovery-ps.txt"
+positive_stray_scan_path="${positive_dir}/stray-scan.txt"
+positive_failure_scan_path="${positive_dir}/startup-failure-scan.txt"
+
+capture_recovery_state "${RECOVERY_PROJECT}" "${WORKDIR}" "${positive_log_path}" "${positive_ps_path}"
+set +e
+scan_stray_dirs "${WORKDIR}" "${positive_stray_scan_path}"
+positive_stray_status=$?
+write_scan_output "${positive_log_path}" "${STARTUP_FAILURE_PATTERN}" "${positive_failure_scan_path}" "no stray startup failure patterns detected"
+positive_failure_status=$?
+set -e
+
+if [[ "${positive_stray_status}" -ne 1 || "${positive_failure_status}" -ne 1 ]]; then
+  a1_details=()
+  [[ "${positive_stray_status}" -eq 1 ]] || a1_details+=("positive-stray-detected")
+  [[ "${positive_failure_status}" -eq 1 ]] || a1_details+=("positive-log-hits")
+  record_assertion "A1" "Happy-path recovery produces no stray directories or explicit stray startup failures" "FAIL" "${positive_dir}" "$(printf '%s; ' "${a1_details[@]}" | sed 's/; $//')"
+else
+  record_assertion "A1" "Happy-path recovery produces no stray directories or explicit stray startup failures" "PASS" "${positive_dir}" "no stray directories or explicit stray startup failure patterns were detected before fault injection"
+fi
+
+RECOVERY_WORKDIR="${WORKDIR}" recovery_compose "${RECOVERY_PROJECT}" down --remove-orphans || true
+
+rm -rf "${negative_workdir}"
+ensure_dir "${negative_workdir}"
+copy_tree "${WORKDIR}/brokers" "${negative_workdir}/brokers"
+
+negative_logdir_path="${negative_workdir}/brokers/broker-${TARGET_BROKER_ID}/${TARGET_LOGDIR_NAME}"
+negative_target_dir="${negative_workdir}/${TARGET_RELATIVE_DIR}"
+negative_preboot_listing_path="${negative_dir}/pre-boot.broker-${TARGET_BROKER_ID}.${TARGET_LOGDIR_NAME}.txt"
+negative_postboot_listing_path="${negative_dir}/post-boot.broker-${TARGET_BROKER_ID}.${TARGET_LOGDIR_NAME}.txt"
+negative_stray_dirs_path="${negative_dir}/stray-dirs.txt"
+negative_log_path="${negative_dir}/recovery.log"
+negative_ps_path="${negative_dir}/recovery-ps.txt"
+negative_stray_log_scan_path="${negative_dir}/stray-log-scan.txt"
+negative_stray_contents_path="${negative_dir}/recovery.default.6p-0-stray.contents.txt"
+negative_partition_metadata_copy="${negative_dir}/recovery.default.6p-0-stray.partition-metadata.txt"
+fault_report_path="${negative_rewrite_dir}/fault-override-report.json"
+fault_checkpoint_path="${negative_rewrite_dir}/${selected_checkpoint_basename}"
+fault_log_path="${negative_rewrite_dir}/00000000000000000000.log"
+fault_command_path="${negative_dir}/fault-override-command.txt"
+tool_path="${SNAPSHOT_REWRITE_TOOL:-${REPO_ROOT}/bin/snapshot-rewrite-tool}"
+
+list_directory_names "${negative_logdir_path}" "${negative_preboot_listing_path}" || true
+
+{
+  printf '%q ' "${tool_path}" \
+    --input "${WORKDIR}/artifacts/rewrite/${selected_checkpoint_basename}" \
+    --output "${fault_checkpoint_path}" \
+    --metadata-log-input "${WORKDIR}/artifacts/rewrite/00000000000000000000.log" \
+    --metadata-log-output "${fault_log_path}" \
+    --surviving-brokers "${SURVIVING_BROKERS}" \
+    --directory-mode UNASSIGNED \
+    --report "${fault_report_path}" \
+    --fault-topic "${TARGET_TOPIC}" \
+    --fault-partition "${TARGET_PARTITION}" \
+    --fault-replicas 8
+  printf '\n'
+} >"${fault_command_path}"
+
+"${tool_path}" \
+  --input "${WORKDIR}/artifacts/rewrite/${selected_checkpoint_basename}" \
+  --output "${fault_checkpoint_path}" \
+  --metadata-log-input "${WORKDIR}/artifacts/rewrite/00000000000000000000.log" \
+  --metadata-log-output "${fault_log_path}" \
+  --surviving-brokers "${SURVIVING_BROKERS}" \
+  --directory-mode UNASSIGNED \
+  --report "${fault_report_path}" \
+  --fault-topic "${TARGET_TOPIC}" \
+  --fault-partition "${TARGET_PARTITION}" \
+  --fault-replicas 8
+
+install_metadata_artifacts "${fault_checkpoint_path}" "${fault_log_path}" "${negative_workdir}"
+touch "${negative_workdir}/.scenario03-fault-injected"
+rm -f "${negative_workdir}/.scenario03-restored-phase"
+
+export RECOVERY_WORKDIR="${negative_workdir}"
+negative_ready=0
+if recovery_compose "${negative_project}" up -d && wait_for_project_ready "${negative_project}" "${negative_workdir}" "${READY_WAIT_ATTEMPTS}" "${READY_WAIT_SECONDS}"; then
+  negative_ready=1
+fi
+capture_recovery_state "${negative_project}" "${negative_workdir}" "${negative_log_path}" "${negative_ps_path}"
+
+stray_wait_ok=1
+if ! wait_for_target_stray "${negative_workdir}"; then
+  stray_wait_ok=0
+fi
+negative_target_stray_dir="$(find_target_stray_dir "${negative_workdir}")"
+list_directory_names "${negative_logdir_path}" "${negative_postboot_listing_path}" || true
+set +e
+scan_stray_dirs "${negative_workdir}" "${negative_stray_dirs_path}"
+negative_stray_status=$?
+write_scan_output "${negative_log_path}" "${STARTUP_FAILURE_PATTERN}" "${negative_stray_log_scan_path}" "no stray log lines detected"
+negative_log_scan_status=$?
+set -e
+
+if [[ -n "${negative_target_stray_dir}" && -d "${negative_target_stray_dir}" ]]; then
+  find "${negative_target_stray_dir}" -maxdepth 1 -mindepth 1 | sed 's#^.*/##' | sort >"${negative_stray_contents_path}"
+  if [[ -f "${negative_target_stray_dir}/partition.metadata" ]]; then
+    cp "${negative_target_stray_dir}/partition.metadata" "${negative_partition_metadata_copy}"
+  fi
+fi
+
+a2_details=()
+[[ "${negative_ready}" -eq 1 ]] || a2_details+=("negative-cluster-not-ready")
+[[ -f "${fault_command_path}" ]] || a2_details+=("fault-command-missing")
+[[ "${stray_wait_ok}" -eq 1 ]] || a2_details+=("target-stray-not-created")
+[[ -n "${negative_target_stray_dir}" && -d "${negative_target_stray_dir}" ]] || a2_details+=("target-stray-dir-missing")
+[[ ! -d "${negative_target_dir}" ]] || a2_details+=("original-dir-still-present")
+[[ "${negative_stray_status}" -eq 0 ]] || a2_details+=("stray-scan-empty")
+[[ "${negative_log_scan_status}" -eq 0 ]] || a2_details+=("negative-log-missing-stray-lines")
+if [[ "${#a2_details[@]}" -eq 0 ]]; then
+  record_assertion "A2" "The injected metadata fault creates the expected stray directory" "PASS" "${negative_dir}" "the fault override produced recovery.default.6p-0.*-stray on broker 0 and the negative logs captured stray handling"
+else
+  record_assertion "A2" "The injected metadata fault creates the expected stray directory" "FAIL" "${negative_dir}" "$(printf '%s; ' "${a2_details[@]}" | sed 's/; $//')"
+fi
+
+a3_details=()
+[[ -f "${negative_stray_contents_path}" ]] || a3_details+=("stray-contents-missing")
+[[ -s "${negative_stray_contents_path}" ]] || a3_details+=("stray-contents-empty")
+[[ -f "${negative_partition_metadata_copy}" ]] || a3_details+=("partition.metadata-missing")
+if [[ "${#a3_details[@]}" -eq 0 ]]; then
+  record_assertion "A3" "Data remains present inside the stray directory during the safety window" "PASS" "${negative_stray_contents_path}" "the target stray directory still contained Kafka partition files before rollback"
+else
+  record_assertion "A3" "Data remains present inside the stray directory during the safety window" "FAIL" "${negative_dir}" "$(printf '%s; ' "${a3_details[@]}" | sed 's/; $//')"
+fi
+
+RECOVERY_WORKDIR="${negative_workdir}" recovery_compose "${negative_project}" down --remove-orphans || true
+
+install_metadata_artifacts "${WORKDIR}/artifacts/rewrite/${selected_checkpoint_basename}" "${WORKDIR}/artifacts/rewrite/00000000000000000000.log" "${negative_workdir}"
+negative_target_stray_dir="$(find_target_stray_dir "${negative_workdir}")"
+if [[ -n "${negative_target_stray_dir}" && -d "${negative_target_stray_dir}" ]]; then
+  mv "${negative_target_stray_dir}" "${negative_target_dir}"
+fi
+rm -f "${negative_workdir}/.scenario03-fault-injected"
+touch "${negative_workdir}/.scenario03-restored-phase"
+
+restored_log_path="${restored_dir}/recovery.log"
+restored_ps_path="${restored_dir}/recovery-ps.txt"
+restored_stray_scan_path="${restored_dir}/stray-scan.txt"
+restored_quorum_status_path="${restored_dir}/quorum-status.txt"
+restored_topic_describe_path="${restored_dir}/topics/recovery.default.6p.describe.txt"
+restored_topic_unavailable_path="${restored_dir}/topics/recovery.default.6p.unavailable.txt"
+restored_partition_count_path="${restored_dir}/samples/recovery.default.6p.p0.count.txt"
+
+export RECOVERY_WORKDIR="${negative_workdir}"
+restored_ready=0
+if recovery_compose "${negative_project}" up -d && wait_for_project_ready "${negative_project}" "${negative_workdir}" "${READY_WAIT_ATTEMPTS}" "${READY_WAIT_SECONDS}"; then
+  restored_ready=1
+fi
+capture_recovery_state "${negative_project}" "${negative_workdir}" "${restored_log_path}" "${restored_ps_path}"
+set +e
+scan_stray_dirs "${negative_workdir}" "${restored_stray_scan_path}"
+restored_stray_status=$?
+set -e
+
+quorum_status_ok=0
+topic_describe_ok=0
+topic_unavailable_ok=0
+partition_count_ok=0
+if [[ "${restored_ready}" -eq 1 ]]; then
+  if capture_quorum_status "${negative_project}" "${negative_workdir}" "${restored_quorum_status_path}"; then
+    quorum_status_ok=1
+  fi
+  if capture_topic_describe "${negative_project}" "${negative_workdir}" "${restored_topic_describe_path}"; then
+    topic_describe_ok=1
+  fi
+  if capture_topic_unavailable "${negative_project}" "${negative_workdir}" "${restored_topic_unavailable_path}"; then
+    topic_unavailable_ok=1
+  fi
+  if capture_partition_count "${negative_project}" "${negative_workdir}" "${restored_partition_count_path}"; then
+    partition_count_ok=1
+  fi
+fi
+
+a4_details=()
+[[ "${restored_ready}" -eq 1 ]] || a4_details+=("restored-cluster-not-ready")
+[[ "${quorum_status_ok}" -eq 1 ]] || a4_details+=("quorum-status-failed")
+[[ "${restored_stray_status}" -eq 1 ]] || a4_details+=("restored-stray-detected")
+[[ "${topic_describe_ok}" -eq 1 ]] || a4_details+=("topic-describe-failed")
+[[ "${topic_unavailable_ok}" -eq 1 ]] || a4_details+=("topic-unavailable-command-failed")
+[[ -f "${restored_topic_unavailable_path}" && -z "$(tr -d '[:space:]' <"${restored_topic_unavailable_path}")" ]] || a4_details+=("topic-has-unavailable-partitions")
+[[ "${partition_count_ok}" -eq 1 ]] || a4_details+=("partition-count-command-failed")
+[[ -f "${restored_partition_count_path}" && "$(cat "${restored_partition_count_path}")" == "${expected_latest_offset}" ]] || a4_details+=("partition-count-mismatch")
+if [[ "${#a4_details[@]}" -eq 0 ]]; then
+  record_assertion "A4" "Restoring the clean metadata and renaming the directory back allows a clean restart" "PASS" "${restored_dir}" "the restored restart formed quorum, produced no stray directories, and recovered the expected count for recovery.default.6p-0"
+else
+  record_assertion "A4" "Restoring the clean metadata and renaming the directory back allows a clean restart" "FAIL" "${restored_dir}" "$(printf '%s; ' "${a4_details[@]}" | sed 's/; $//')"
+fi
+
+RECOVERY_WORKDIR="${negative_workdir}" recovery_compose "${negative_project}" down --remove-orphans || true
+
+summary_status="pass"
+if [[ "${had_failure}" -ne 0 ]]; then
+  summary_status="fail"
+fi
+
+jq -s \
+  --arg scenario "${scenario_id}" \
+  --arg run_id "${run_id}" \
+  --arg snapshot_label "${SNAPSHOT_LABEL}" \
+  --arg status "${summary_status}" \
+  --arg generated_at_utc "$(timestamp_utc)" \
+  '{
+    scenario: $scenario,
+    run_id: $run_id,
+    snapshot_label: $snapshot_label,
+    status: $status,
+    generated_at_utc: $generated_at_utc,
+    assertions: .
+  }' "${assertions_jsonl_path}" >"${summary_path}"
+
+log "scenario 03 assert artifacts written to ${assert_dir}"
+
+if [[ "${summary_status}" != "pass" ]]; then
+  exit 1
+fi

@@ -21,9 +21,10 @@ The repo is no longer spec-only. The current state is:
 - Scenario 06 is fully automated and passed cleanly on 2026-04-21 with run ID `20260421T141350Z`
 - Scenario 07 is fully automated and passed cleanly on 2026-04-21 with run ID `20260421T143125Z`
 - Scenario 08 is fully automated and passed cleanly on 2026-04-21 with run ID `20260421T131900Z`
+- Scenario 03 is fully automated and passed cleanly on 2026-04-21 with run ID `20260421T154928Z`
 - the harness now supports worktree-friendly root overrides so scenario work can run from a dedicated Git worktree while still pointing at shared snapshot artifacts
 
-Use [`scenario-implementation-roadmap.md`](./scenario-implementation-roadmap.md) as the authoritative execution plan. Scenario 01, Scenario 02, Scenario 04, Scenario 05, Scenario 06, Scenario 07, and Scenario 08 are now the completed anchors; Scenario 03 is the next implementation target.
+Use [`scenario-implementation-roadmap.md`](./scenario-implementation-roadmap.md) as the authoritative execution plan. Scenario 01, Scenario 02, Scenario 03, Scenario 04, Scenario 05, Scenario 06, Scenario 07, and Scenario 08 are now the completed anchors; Scenario 10 is the next implementation target.
 
 ## Implemented Files
 
@@ -73,6 +74,8 @@ Use [`scenario-implementation-roadmap.md`](./scenario-implementation-roadmap.md)
 - `automation/tests/scenario_01_report_test.sh`
 - `automation/tests/scenario_02_assert_test.sh`
 - `automation/tests/scenario_02_report_test.sh`
+- `automation/tests/scenario_03_assert_test.sh`
+- `automation/tests/scenario_03_report_test.sh`
 - `automation/tests/scenario_04_assert_test.sh`
 - `automation/tests/scenario_04_report_test.sh`
 - `automation/tests/scenario_05_assert_test.sh`
@@ -184,6 +187,16 @@ These checks were completed successfully:
   - `automation/recovery/up scenario-08 20260421T131900Z`
   - `automation/scenarios/scenario-08/assert 20260421T131900Z`
   - `automation/scenarios/scenario-08/report 20260421T131900Z`
+- targeted Scenario 03 shell tests:
+  - `bash automation/tests/scenario_03_assert_test.sh`
+  - `bash automation/tests/scenario_03_report_test.sh`
+- real Scenario 03 recovery boot, assert, report, and teardown after:
+  - `SNAPSHOTS_ROOT=/tmp/poc-kafka-snapshot-recovery-scenario-06/fixtures/snapshots automation/recovery/prepare scenario-03 baseline-clean-v3 20260421T154928Z`
+  - `automation/recovery/rewrite scenario-03 20260421T154928Z`
+  - `automation/recovery/up scenario-03 20260421T154928Z`
+  - `SCENARIO03_READY_WAIT_ATTEMPTS=90 automation/scenarios/scenario-03/assert 20260421T154928Z`
+  - `automation/scenarios/scenario-03/report 20260421T154928Z`
+  - `automation/recovery/down scenario-03 20260421T154928Z`
 
 Important runtime detail:
 
@@ -193,8 +206,7 @@ Important runtime detail:
 
 ## Known Gaps
 
-- Scenarios 03, 10, 11, and 12 are still planned work
-- Scenario 03 still needs an explicit, reproducible fault-injection mechanism
+- Scenarios 10, 11, and 12 are still planned work
 - Scenario 11 and Scenario 12 still need a report bundle convention and normalized diff strategy
 - Scenario 09 remains intentionally deferred until the clean-stop suite is green
 
@@ -212,6 +224,8 @@ Important runtime detail:
 - compacted-topic fixture JSON now preserves `key_prefix` for compacted topics, and `baseline-clean-v3` is the corrected snapshot revision for Scenario 06
 - metadata-log rewrite now converts retained Raft control batches into metadata `NoOpRecord`s and passes unrelated metadata tail records through unchanged instead of aborting the rewrite
 - transaction-state validation now uses a repo-managed `confluent-kafka` probe helper for both `read_committed` checks and post-recovery transactional producer commits, avoiding new host dependencies
+- the snapshot rewrite tool now exposes an explicit partition-replica fault override hook, and Scenario 03 uses it to force deterministic stray handling in an isolated negative-path clone
+- Scenario 03 rollback now accounts for Kafka's tokenized `<topic>-<partition>.<token>-stray` rename pattern rather than assuming a plain `-stray` suffix
 
 These fixes matter because an earlier shared-network setup allowed recovery brokers to resolve source-cluster hostnames and join the wrong Raft peer, which looked like mysterious epoch jumps rather than an obvious wiring failure.
 
@@ -222,7 +236,7 @@ From repo root:
 ```bash
 sed -n '1,220p' AGENTS.md
 sed -n '1,260p' docs/recovery/scenario-implementation-roadmap.md
-sed -n '1,220p' docs/recovery/scenarios/scenario-03-stray-detection-safety-net.md
+sed -n '1,220p' docs/recovery/scenarios/scenario-10-rf1-steady-state-and-expansion.md
 ```
 
 The latest green reports are:
@@ -235,12 +249,13 @@ sed -n '1,220p' docs/recovery/reports/runs/2026-04-21-scenario-05-20260421T11380
 sed -n '1,220p' docs/recovery/reports/runs/2026-04-21-scenario-06-20260421T141350Z.md
 sed -n '1,220p' docs/recovery/reports/runs/2026-04-21-scenario-07-20260421T143125Z.md
 sed -n '1,220p' docs/recovery/reports/runs/2026-04-21-scenario-08-20260421T131900Z.md
+sed -n '1,220p' docs/recovery/reports/runs/2026-04-21-scenario-03-20260421T154928Z.md
 ```
 
 Then resume from the next scenario:
 
 ```bash
-sed -n '1,260p' docs/recovery/scenarios/scenario-03-stray-detection-safety-net.md
+sed -n '1,260p' docs/recovery/scenarios/scenario-10-rf1-steady-state-and-expansion.md
 ```
 
 `<run-id>` is written into `fixtures/scenario-runs/<scenario-id>/<run-id>/run.env` by `automation/recovery/prepare`.

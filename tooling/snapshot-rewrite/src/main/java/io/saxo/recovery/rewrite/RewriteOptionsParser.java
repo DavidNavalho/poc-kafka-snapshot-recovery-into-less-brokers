@@ -17,6 +17,9 @@ final class RewriteOptionsParser {
         Path report = null;
         Path metadataLogInput = null;
         Path metadataLogOutput = null;
+        String faultTopic = null;
+        Integer faultPartition = null;
+        String faultReplicas = null;
 
         for (int index = 0; index < args.length; index++) {
             String argument = args[index];
@@ -28,6 +31,9 @@ final class RewriteOptionsParser {
                 case "--report" -> report = Path.of(readValue(argument, args, ++index));
                 case "--metadata-log-input" -> metadataLogInput = Path.of(readValue(argument, args, ++index));
                 case "--metadata-log-output" -> metadataLogOutput = Path.of(readValue(argument, args, ++index));
+                case "--fault-topic" -> faultTopic = readValue(argument, args, ++index);
+                case "--fault-partition" -> faultPartition = parseIntegerArgument(argument, readValue(argument, args, ++index));
+                case "--fault-replicas" -> faultReplicas = readValue(argument, args, ++index);
                 case "--rewrite-voters" -> rewriteVoters = true;
                 case "--help" -> throw new RewriteException(usage());
                 default -> throw new RewriteException("unknown argument: " + argument + System.lineSeparator() + usage());
@@ -59,6 +65,22 @@ final class RewriteOptionsParser {
                     System.lineSeparator() + usage()
             );
         }
+        if ((faultTopic != null) || (faultPartition != null) || (faultReplicas != null)) {
+            if (faultTopic == null || faultPartition == null || faultReplicas == null) {
+                throw new RewriteException(
+                    "fault injection requires --fault-topic, --fault-partition, and --fault-replicas together" +
+                        System.lineSeparator() + usage()
+                );
+            }
+        }
+
+        List<Integer> parsedFaultReplicas = faultReplicas == null ? List.of() : parseReplicaIds(faultReplicas);
+        Optional<PartitionReplicaOverride> partitionReplicaOverride = Optional.empty();
+        if (faultTopic != null) {
+            partitionReplicaOverride = Optional.of(
+                new PartitionReplicaOverride(faultTopic, faultPartition, parsedFaultReplicas, parsedFaultReplicas.getFirst())
+            );
+        }
 
         return new RewriteOptions(
             input,
@@ -68,7 +90,8 @@ final class RewriteOptionsParser {
             rewriteVoters,
             report,
             Optional.ofNullable(metadataLogInput),
-            Optional.ofNullable(metadataLogOutput)
+            Optional.ofNullable(metadataLogOutput),
+            partitionReplicaOverride
         );
     }
 
@@ -76,7 +99,8 @@ final class RewriteOptionsParser {
         return """
             usage: snapshot-rewrite-tool --input <checkpoint> --output <checkpoint> \
               --surviving-brokers <csv> --directory-mode UNASSIGNED --report <json> \
-              [--rewrite-voters] [--metadata-log-input <log>] [--metadata-log-output <log>]
+              [--rewrite-voters] [--metadata-log-input <log>] [--metadata-log-output <log>] \
+              [--fault-topic <topic> --fault-partition <id> --fault-replicas <csv>]
             """.stripTrailing();
     }
 
@@ -113,5 +137,41 @@ final class RewriteOptionsParser {
         }
 
         return parsed.stream().sorted(Comparator.naturalOrder()).toList();
+    }
+
+    private int parseIntegerArgument(String option, String raw) {
+        try {
+            return Integer.parseInt(raw);
+        } catch (NumberFormatException exception) {
+            throw new RewriteException("invalid integer for " + option + ": " + raw);
+        }
+    }
+
+    private List<Integer> parseReplicaIds(String raw) {
+        if (raw.isBlank()) {
+            throw new RewriteException("replica id list must not be empty");
+        }
+
+        String[] parts = raw.split(",");
+        LinkedHashSet<Integer> parsed = new LinkedHashSet<>();
+        for (String part : parts) {
+            String token = part.trim();
+            if (token.isEmpty()) {
+                throw new RewriteException("replica id list contains an empty entry");
+            }
+
+            int brokerId;
+            try {
+                brokerId = Integer.parseInt(token);
+            } catch (NumberFormatException exception) {
+                throw new RewriteException("invalid replica id: " + token);
+            }
+
+            if (!parsed.add(brokerId)) {
+                throw new RewriteException("duplicate replica id: " + brokerId);
+            }
+        }
+
+        return List.copyOf(parsed);
     }
 }

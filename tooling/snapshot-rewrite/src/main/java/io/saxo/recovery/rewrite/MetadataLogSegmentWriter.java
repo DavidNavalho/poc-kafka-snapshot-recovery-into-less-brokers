@@ -11,6 +11,7 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import org.apache.kafka.common.DirectoryId;
 import org.apache.kafka.common.Uuid;
@@ -21,6 +22,7 @@ import org.apache.kafka.common.metadata.PartitionChangeRecord;
 import org.apache.kafka.common.metadata.PartitionRecord;
 import org.apache.kafka.common.metadata.RegisterBrokerRecord;
 import org.apache.kafka.common.metadata.RegisterControllerRecord;
+import org.apache.kafka.common.metadata.TopicRecord;
 import org.apache.kafka.common.protocol.ObjectSerializationCache;
 import org.apache.kafka.common.protocol.Readable;
 import org.apache.kafka.common.protocol.ByteBufferAccessor;
@@ -52,7 +54,9 @@ final class MetadataLogSegmentWriter {
             throw new RewriteException("input metadata log does not exist: " + inputLogPath);
         }
 
+        Map<Uuid, String> topicNamesById = collectTopicNames(rewrittenSnapshot.records());
         Map<TopicPartitionKey, PartitionTailState> partitionStates = partitionStatesFrom(rewrittenSnapshot.records());
+        applyPartitionReplicaOverrideToState(partitionStates, topicNamesById, options.partitionReplicaOverride());
         Set<Integer> survivingSet = new LinkedHashSet<>(options.survivingBrokers());
 
         try {
@@ -80,7 +84,13 @@ final class MetadataLogSegmentWriter {
                                 batch.baseOffset() + "-" + batch.lastOffset()
                         );
                     }
-                    MemoryRecords rewrittenBatch = rewriteTailBatch(batch, partitionStates, survivingSet);
+                    MemoryRecords rewrittenBatch = rewriteTailBatch(
+                        batch,
+                        partitionStates,
+                        topicNamesById,
+                        survivingSet,
+                        options.partitionReplicaOverride()
+                    );
                     rewrittenBatch.writeFullyTo(outputChannel);
                 }
                 outputChannel.force(true);
@@ -164,7 +174,9 @@ final class MetadataLogSegmentWriter {
     private MemoryRecords rewriteTailBatch(
         FileChannelRecordBatch sourceBatch,
         Map<TopicPartitionKey, PartitionTailState> partitionStates,
-        Set<Integer> survivingSet
+        Map<Uuid, String> topicNamesById,
+        Set<Integer> survivingSet,
+        Optional<PartitionReplicaOverride> partitionReplicaOverride
     ) {
         if (sourceBatch.compressionType() != CompressionType.NONE) {
             throw new RewriteException("compressed metadata log batches are not supported");
@@ -192,7 +204,13 @@ final class MetadataLogSegmentWriter {
 
         for (Record sourceRecord : sourceBatch) {
             ApiMessageAndVersion original = deserialize(sourceRecord);
-            ApiMessageAndVersion rewritten = rewriteTailRecord(original, partitionStates, survivingSet);
+            ApiMessageAndVersion rewritten = rewriteTailRecord(
+                original,
+                partitionStates,
+                topicNamesById,
+                survivingSet,
+                partitionReplicaOverride
+            );
             ByteBuffer value = serialize(rewritten);
             builder.appendWithOffset(sourceRecord.offset(), new org.apache.kafka.common.record.SimpleRecord(sourceRecord.timestamp(), null, value));
         }
@@ -232,7 +250,9 @@ final class MetadataLogSegmentWriter {
     private ApiMessageAndVersion rewriteTailRecord(
         ApiMessageAndVersion original,
         Map<TopicPartitionKey, PartitionTailState> partitionStates,
-        Set<Integer> survivingSet
+        Map<Uuid, String> topicNamesById,
+        Set<Integer> survivingSet,
+        Optional<PartitionReplicaOverride> partitionReplicaOverride
     ) {
         if (original.message() instanceof NoOpRecord) {
             return original;
@@ -296,6 +316,19 @@ final class MetadataLogSegmentWriter {
                 rewritten.setDirectories(List.of(DirectoryId.unassignedArray(effectiveReplicas.size())));
             }
 
+            String topicName = topicNamesById.getOrDefault(partitionChangeRecord.topicId(), partitionChangeRecord.topicId().toString());
+            if (partitionReplicaOverride.filter(override -> override.matches(topicName, partitionChangeRecord.partitionId())).isPresent()) {
+                PartitionReplicaOverride override = partitionReplicaOverride.orElseThrow();
+                rewritten.setReplicas(override.replicas());
+                rewritten.setIsr(override.replicas());
+                rewritten.setRemovingReplicas(List.of());
+                rewritten.setAddingReplicas(List.of());
+                rewritten.setLeader(override.leaderId());
+                rewritten.setDirectories(List.of(DirectoryId.unassignedArray(override.replicas().size())));
+                rewritten.setEligibleLeaderReplicas(List.of());
+                rewritten.setLastKnownElr(List.of());
+            }
+
             partitionStates.put(key, applyChange(currentState, rewritten));
             return new ApiMessageAndVersion(rewritten, original.version());
         }
@@ -321,6 +354,33 @@ final class MetadataLogSegmentWriter {
             }
         }
         return partitionStates;
+    }
+
+    private Map<Uuid, String> collectTopicNames(List<ApiMessageAndVersion> records) {
+        Map<Uuid, String> topicNames = new HashMap<>();
+        for (ApiMessageAndVersion record : records) {
+            if (record.message() instanceof TopicRecord topicRecord) {
+                topicNames.put(topicRecord.topicId(), topicRecord.name());
+            }
+        }
+        return topicNames;
+    }
+
+    private void applyPartitionReplicaOverrideToState(
+        Map<TopicPartitionKey, PartitionTailState> partitionStates,
+        Map<Uuid, String> topicNamesById,
+        Optional<PartitionReplicaOverride> partitionReplicaOverride
+    ) {
+        if (partitionReplicaOverride.isEmpty()) {
+            return;
+        }
+        PartitionReplicaOverride override = partitionReplicaOverride.orElseThrow();
+        for (Map.Entry<TopicPartitionKey, PartitionTailState> entry : partitionStates.entrySet()) {
+            String topicName = topicNamesById.getOrDefault(entry.getKey().topicId(), entry.getKey().topicId().toString());
+            if (override.matches(topicName, entry.getKey().partitionId())) {
+                entry.setValue(new PartitionTailState(override.replicas(), override.replicas(), override.leaderId()));
+            }
+        }
     }
 
     private TimestampType timestampTypeFor(FileChannelRecordBatch batch) {

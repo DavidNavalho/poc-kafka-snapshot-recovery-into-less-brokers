@@ -79,6 +79,7 @@ class CheckpointRoundTripTest {
                 false,
                 tempDir.resolve("report.json"),
                 Optional.empty(),
+                Optional.empty(),
                 Optional.empty()
             )
         );
@@ -171,6 +172,7 @@ class CheckpointRoundTripTest {
                 false,
                 tempDir.resolve("report.json"),
                 Optional.empty(),
+                Optional.empty(),
                 Optional.empty()
             )
         );
@@ -183,6 +185,57 @@ class CheckpointRoundTripTest {
         assertEquals(List.of(), rewrittenPartition.addingReplicas());
         assertEquals(List.of(), rewrittenPartition.eligibleLeaderReplicas());
         assertEquals(List.of(), rewrittenPartition.lastKnownElr());
+    }
+
+    @Test
+    void appliesExplicitFaultOverrideAfterNormalRewrite() {
+        Uuid topicId = Uuid.randomUuid();
+        CheckpointSnapshot snapshot = new CheckpointSnapshot(
+            new OffsetAndEpoch(42L, 3),
+            123456789L,
+            KRaftVersion.KRAFT_VERSION_0,
+            Optional.empty(),
+            List.of(
+                new ApiMessageAndVersion(new TopicRecord().setName("recovery.default.6p").setTopicId(topicId), (short) 0),
+                new ApiMessageAndVersion(
+                    new PartitionRecord()
+                        .setTopicId(topicId)
+                        .setPartitionId(0)
+                        .setReplicas(List.of(2, 8))
+                        .setIsr(List.of(2, 8))
+                        .setLeader(2)
+                        .setLeaderRecoveryState((byte) 0)
+                        .setLeaderEpoch(5)
+                        .setPartitionEpoch(8)
+                        .setDirectories(List.of(Uuid.randomUuid(), Uuid.randomUuid())),
+                    (short) 2
+                )
+            )
+        );
+
+        RewriteExecutionResult result = new CheckpointRewriteEngine().rewrite(
+            snapshot,
+            new RewriteOptions(
+                tempDir.resolve("in.checkpoint"),
+                tempDir.resolve("out.checkpoint"),
+                List.of(0, 1, 2),
+                DirectoryMode.UNASSIGNED,
+                false,
+                tempDir.resolve("report.json"),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.of(new PartitionReplicaOverride("recovery.default.6p", 0, List.of(8), 8))
+            )
+        );
+
+        PartitionRecord rewrittenPartition = assertInstanceOf(
+            PartitionRecord.class,
+            result.snapshot().records().get(1).message()
+        );
+        assertEquals(List.of(8), rewrittenPartition.replicas());
+        assertEquals(List.of(8), rewrittenPartition.isr());
+        assertEquals(8, rewrittenPartition.leader());
+        assertEquals(List.of(DirectoryId.UNASSIGNED), rewrittenPartition.directories());
     }
 
     private RegisterBrokerRecord registerBroker(int brokerId) {

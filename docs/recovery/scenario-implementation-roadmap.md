@@ -22,6 +22,7 @@ This file is the current planning authority for:
 - Scenario 06 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T141350Z`.
 - Scenario 07 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T143125Z`.
 - Scenario 08 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T131900Z`.
+- Scenario 03 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T154928Z`.
 - Two important runtime issues were already found and fixed:
   - source and recovery clusters must not share the same Docker network namespace
   - copied metadata snapshot directories must be cleaned more aggressively before installing rewritten state
@@ -317,25 +318,13 @@ Done gate:
 
 Current status:
 
-- not automated yet
-- intentionally deferred until the happy path is already solid
-
-Spec before implementation:
-
-- define the exact metadata mutation used to force a partition into stray handling
-- define the directory and log signatures that count as a successful negative-path trigger
-- define the rollback steps precisely enough that data is not lost during the test
-- define how the positive case reuses Scenario 01 checks rather than duplicating them
-
-Likely implementation focus:
-
-- explicit fault-injection helper or test hook
-- directory listing capture before and after rename recovery
-- cleanup logic that never reuses a mutated workdir accidentally
+- implemented and validated from a fresh worktree
+- latest clean report: `docs/recovery/reports/runs/2026-04-21-scenario-03-20260421T154928Z.md`
+- the harness now supports a deterministic partition-replica fault override and an isolated rollback/restart path for preserved stray directories
 
 Done gate:
 
-- the positive case stays clean, the negative case deterministically produces preserved `-stray` evidence, and the restored metadata path recovers cleanly
+- achieved on 2026-04-21 by run `20260421T154928Z`
 
 ### Scenario 10: RF=1 Steady State And Replica Expansion
 

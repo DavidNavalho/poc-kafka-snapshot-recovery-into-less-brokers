@@ -21,6 +21,7 @@ class RewriteReportWriterTest {
             true,
             Path.of("/tmp/report.json"),
             Optional.empty(),
+            Optional.empty(),
             Optional.empty()
         );
         CheckpointMetadata input = new CheckpointMetadata(
@@ -73,6 +74,7 @@ class RewriteReportWriterTest {
             DirectoryMode.UNASSIGNED,
             false,
             Path.of("/tmp/report.json"),
+            Optional.empty(),
             Optional.empty(),
             Optional.empty()
         );

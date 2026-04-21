@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+require_cmd docker
+require_cmd jq
+
+scenario_id="scenario-03"
+run_id="${1:-}"
+
+[[ -n "${run_id}" ]] || fail "usage: automation/scenarios/scenario-03/report <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+
+summary_path="${WORKDIR}/artifacts/assert/assert-summary.json"
+snapshot_manifest_path="${WORKDIR}/snapshot-manifest.json"
+report_date="$(date -u +%F)"
+report_path="${REPORT_RUNS_ROOT}/${report_date}-scenario-03-${run_id}.md"
+recovery_image="$(jq -r '.image.vendor + "/" + .image.product + ":" + .image.tag' "${snapshot_manifest_path}")"
+source_fixture_version="$(jq -r '.source_fixture_version // "unknown"' "${snapshot_manifest_path}")"
+summary_status="$(jq -r '.status // "fail"' "${summary_path}")"
+docker_server_version="$(docker version --format '{{.Server.Version}}' 2>/dev/null || printf 'unknown')"
+docker_compose_version="$(docker compose version --short 2>/dev/null || printf 'unknown')"
+host_machine="$(hostname)"
+
+case "${summary_status}" in
+  pass) result_label="PASS" ;;
+  fail) result_label="FAIL" ;;
+  *) result_label="PARTIAL" ;;
+esac
+
+assertions_table="$(
+  jq -r '.assertions[] | [.name, .result, .evidence] | @tsv' "${summary_path}" | while IFS=$'\t' read -r name result evidence; do
+    printf '| %s | %s | `%s` |\n' "${name}" "${result}" "${evidence}"
+  done
+)"
+
+findings_block="- none"
+if [[ "${summary_status}" != "pass" ]]; then
+  findings_block="$(
+    jq -r '.assertions[] | select(.result != "PASS") | "- " + .name + ": " + .details' "${summary_path}"
+  )"
+fi
+
+cat >"${report_path}" <<EOF
+# Scenario 03 Report
+
+- Run ID: ${run_id}
+- Result: ${result_label}
+- Snapshot Label: ${SNAPSHOT_LABEL}
+- Source Fixture Version: ${source_fixture_version}
+- Recovery Image: ${recovery_image}
+- Docker Server: ${docker_server_version}
+- Docker Compose: ${docker_compose_version}
+- Host: ${host_machine}
+
+## Summary
+
+Scenario 03 validates the stray-detection safety net in three phases:
+
+- Happy Path: the clean rewritten recovery must start without any stray directories or explicit stray startup failures.
+- Injected Fault: the harness rewrites one known partition assignment so Kafka renames that on-disk directory to \`*-stray\`.
+- Restored Restart: the harness restores the clean rewritten metadata, renames the stray directory back, and verifies the cluster boots cleanly again.
+
+## Assertions
+
+| Assertion | Result | Evidence |
+| --- | --- | --- |
+${assertions_table}
+
+## Happy Path
+
+- Positive stray scan: \`${WORKDIR}/artifacts/assert/positive/stray-scan.txt\`
+- Positive startup scan: \`${WORKDIR}/artifacts/assert/positive/startup-failure-scan.txt\`
+- Positive recovery logs: \`${WORKDIR}/artifacts/assert/positive/recovery.log\`
+
+## Injected Fault
+
+- Fault override command: \`${WORKDIR}/artifacts/assert/negative/fault-override-command.txt\`
+- Pre-boot listing: \`${WORKDIR}/artifacts/assert/negative/pre-boot.broker-0.logdir-0.txt\`
+- Post-boot listing: \`${WORKDIR}/artifacts/assert/negative/post-boot.broker-0.logdir-0.txt\`
+- Stray directory scan: \`${WORKDIR}/artifacts/assert/negative/stray-dirs.txt\`
+- Stray contents: \`${WORKDIR}/artifacts/assert/negative/recovery.default.6p-0-stray.contents.txt\`
+- Negative recovery logs: \`${WORKDIR}/artifacts/assert/negative/recovery.log\`
+
+## Restored Restart
+
+- Restored quorum status: \`${WORKDIR}/artifacts/assert/restored/quorum-status.txt\`
+- Restored stray scan: \`${WORKDIR}/artifacts/assert/restored/stray-scan.txt\`
+- Restored topic describe: \`${WORKDIR}/artifacts/assert/restored/topics/recovery.default.6p.describe.txt\`
+- Restored partition count: \`${WORKDIR}/artifacts/assert/restored/samples/recovery.default.6p.p0.count.txt\`
+- Restored recovery logs: \`${WORKDIR}/artifacts/assert/restored/recovery.log\`
+
+## Findings
+
+${findings_block}
+
+## Follow-Up
+
+- Scenario 03 is ${result_label}.
+- Proceed to Scenario 10 when this result is acceptable.
+EOF
+
+log "scenario 03 report written to ${report_path}"

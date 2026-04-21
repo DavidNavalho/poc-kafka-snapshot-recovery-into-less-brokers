@@ -12,6 +12,7 @@ record RewriteOptions(
     boolean rewriteVoters,
     Path report,
     Optional<Path> metadataLogInput,
-    Optional<Path> metadataLogOutput
+    Optional<Path> metadataLogOutput,
+    Optional<PartitionReplicaOverride> partitionReplicaOverride
 ) {
 }

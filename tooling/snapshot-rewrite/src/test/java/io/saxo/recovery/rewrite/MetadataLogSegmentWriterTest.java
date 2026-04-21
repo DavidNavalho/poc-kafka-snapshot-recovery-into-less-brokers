@@ -183,6 +183,31 @@ class MetadataLogSegmentWriterTest {
     }
 
     @Test
+    void appliesExplicitFaultOverrideToPartitionTailRecords() throws Exception {
+        Path input = tempDir.resolve("input-fault-override.log");
+        Path output = tempDir.resolve("output-fault-override.log");
+        MetadataLogSegmentWriterTestSupport support = new MetadataLogSegmentWriterTestSupport();
+        Uuid topicId = Uuid.randomUuid();
+        support.writeSingleRecordBatches(input, 8030L, noOp(), partitionChange(topicId));
+
+        new MetadataLogSegmentWriter().rewrite(
+            input,
+            output,
+            snapshotWithNamedPartition(8030L, topicId, "recovery.default.6p"),
+            options(List.of(0, 1, 2), Optional.of(new PartitionReplicaOverride("recovery.default.6p", 0, List.of(8), 8)))
+        );
+
+        List<MetadataLogSegmentWriterTestSupport.DecodedRecord> records = support.records(output);
+        assertEquals(List.of(8030L, 8031L), records.stream().map(MetadataLogSegmentWriterTestSupport.DecodedRecord::offset).toList());
+        assertInstanceOf(NoOpRecord.class, records.get(0).record().message());
+        PartitionChangeRecord rewritten = assertInstanceOf(PartitionChangeRecord.class, records.get(1).record().message());
+        assertEquals(List.of(8), rewritten.replicas());
+        assertEquals(List.of(8), rewritten.isr());
+        assertEquals(8, rewritten.leader());
+        assertEquals(List.of(DirectoryId.UNASSIGNED), rewritten.directories());
+    }
+
+    @Test
     void passesThroughNonPartitionMetadataTailRecordsUnchanged() throws Exception {
         Path input = tempDir.resolve("input-topic-tail.log");
         Path output = tempDir.resolve("output-topic-tail.log");
@@ -231,6 +256,10 @@ class MetadataLogSegmentWriterTest {
     }
 
     private RewriteOptions options(List<Integer> survivingBrokers) {
+        return options(survivingBrokers, Optional.empty());
+    }
+
+    private RewriteOptions options(List<Integer> survivingBrokers, Optional<PartitionReplicaOverride> partitionReplicaOverride) {
         return new RewriteOptions(
             tempDir.resolve("input.checkpoint"),
             tempDir.resolve("output.checkpoint"),
@@ -239,7 +268,8 @@ class MetadataLogSegmentWriterTest {
             false,
             tempDir.resolve("report.json"),
             Optional.empty(),
-            Optional.empty()
+            Optional.empty(),
+            partitionReplicaOverride
         );
     }
 
@@ -254,30 +284,39 @@ class MetadataLogSegmentWriterTest {
     }
 
     private CheckpointSnapshot snapshotWithPartition(long offset, Uuid topicId) {
+        return snapshotWithNamedPartition(offset, topicId, null);
+    }
+
+    private CheckpointSnapshot snapshotWithNamedPartition(long offset, Uuid topicId, String topicName) {
+        List<ApiMessageAndVersion> records = new ArrayList<>();
+        if (topicName != null) {
+            records.add(new ApiMessageAndVersion(new TopicRecord().setName(topicName).setTopicId(topicId), (short) 0));
+        }
+        records.add(
+            new ApiMessageAndVersion(
+                new PartitionRecord()
+                    .setTopicId(topicId)
+                    .setPartitionId(0)
+                    .setReplicas(List.of(0))
+                    .setIsr(List.of(0))
+                    .setRemovingReplicas(List.of())
+                    .setAddingReplicas(List.of())
+                    .setLeader(0)
+                    .setLeaderRecoveryState((byte) 0)
+                    .setLeaderEpoch(5)
+                    .setPartitionEpoch(8)
+                    .setDirectories(List.of(DirectoryId.UNASSIGNED))
+                    .setEligibleLeaderReplicas(List.of(0))
+                    .setLastKnownElr(List.of()),
+                (short) 2
+            )
+        );
         return new CheckpointSnapshot(
             new OffsetAndEpoch(offset, 1),
             123L,
             KRaftVersion.KRAFT_VERSION_0,
             Optional.empty(),
-            List.of(
-                new ApiMessageAndVersion(
-                    new PartitionRecord()
-                        .setTopicId(topicId)
-                        .setPartitionId(0)
-                        .setReplicas(List.of(0))
-                        .setIsr(List.of(0))
-                        .setRemovingReplicas(List.of())
-                        .setAddingReplicas(List.of())
-                        .setLeader(0)
-                        .setLeaderRecoveryState((byte) 0)
-                        .setLeaderEpoch(5)
-                        .setPartitionEpoch(8)
-                        .setDirectories(List.of(DirectoryId.UNASSIGNED))
-                        .setEligibleLeaderReplicas(List.of(0))
-                        .setLastKnownElr(List.of()),
-                    (short) 2
-                )
-            )
+            List.copyOf(records)
         );
     }
 
