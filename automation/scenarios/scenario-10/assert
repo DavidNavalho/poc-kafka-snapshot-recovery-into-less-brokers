@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+require_cmd docker
+require_cmd jq
+require_cmd python3
+
+scenario_id="scenario-10"
+run_id="${1:-}"
+
+[[ -n "${run_id}" ]] || fail "usage: automation/scenarios/scenario-10/assert <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+export RECOVERY_WORKDIR="${WORKDIR}"
+
+assert_dir="${WORKDIR}/artifacts/assert"
+topic_artifact_dir="${assert_dir}/topics"
+reassignment_artifact_dir="${assert_dir}/reassignment"
+sample_artifact_dir="${assert_dir}/samples"
+recovery_artifact_dir="${WORKDIR}/artifacts/recovery"
+recovery_log_path="${recovery_artifact_dir}/docker-compose.log"
+recovery_ps_path="${assert_dir}/recovery-ps.txt"
+summary_path="${assert_dir}/assert-summary.json"
+assertions_jsonl_path="${assert_dir}/assertions.jsonl"
+snapshot_manifest_path="${WORKDIR}/snapshot-manifest.json"
+
+ensure_dir "${topic_artifact_dir}"
+ensure_dir "${reassignment_artifact_dir}"
+ensure_dir "${sample_artifact_dir}"
+ensure_dir "${recovery_artifact_dir}"
+: >"${assertions_jsonl_path}"
+
+readonly TARGET_TOPIC="recovery.default.6p"
+readonly TARGET_PARTITIONS=(0 1 2)
+readonly TARGET_PARTITIONS_CSV="0,1,2"
+readonly TARGET_REPLICAS_CSV="0,1,2"
+readonly CONVERGENCE_ATTEMPTS="${SCENARIO10_REASSIGN_WAIT_ATTEMPTS:-90}"
+readonly CONVERGENCE_SLEEP_SECONDS="${SCENARIO10_REASSIGN_WAIT_SECONDS:-2}"
+
+had_failure=0
+
+record_assertion() {
+  local id="$1"
+  local name="$2"
+  local result="$3"
+  local evidence="$4"
+  local details="$5"
+
+  if [[ "${result}" != "PASS" ]]; then
+    had_failure=1
+  fi
+
+  jq -nc \
+    --arg id "${id}" \
+    --arg name "${name}" \
+    --arg result "${result}" \
+    --arg evidence "${evidence}" \
+    --arg details "${details}" \
+    '{id: $id, name: $name, result: $result, evidence: $evidence, details: $details}' >>"${assertions_jsonl_path}"
+}
+
+capture_recovery_state() {
+  recovery_compose "${RECOVERY_PROJECT}" logs --no-color >"${recovery_log_path}" || true
+  recovery_compose "${RECOVERY_PROJECT}" ps >"${recovery_ps_path}" || true
+}
+
+capture_topic_describe() {
+  local output_path="$1"
+  recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 bash -lc "
+    kafka-topics --bootstrap-server kafka-0:9092 --describe --topic '${TARGET_TOPIC}' </dev/null
+  " >"${output_path}"
+}
+
+capture_under_replicated() {
+  local output_path="$1"
+  recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 bash -lc "
+    kafka-topics --bootstrap-server kafka-0:9092 --describe --topic '${TARGET_TOPIC}' --under-replicated-partitions </dev/null
+  " >"${output_path}"
+}
+
+normalize_topic_describe() {
+  local input_path="$1"
+  local output_path="$2"
+  python3 "${REPO_ROOT}/automation/lib/normalize_topic_describe.py" \
+    --input "${input_path}" \
+    --topic "${TARGET_TOPIC}" \
+    --partitions "${TARGET_PARTITIONS_CSV}" \
+    --output "${output_path}"
+}
+
+check_topic_state() {
+  local mode="$1"
+  local normalized_path="$2"
+  python3 - "${mode}" "${normalized_path}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+mode = sys.argv[1]
+path = Path(sys.argv[2])
+state = json.loads(path.read_text(encoding="utf-8"))
+partitions = ["0", "1", "2"]
+
+for partition in partitions:
+    entry = state.get(partition)
+    if entry is None:
+        raise SystemExit(1)
+    replicas = entry.get("replicas", [])
+    isr = entry.get("isr", [])
+    if mode == "pre":
+        if len(replicas) != 1 or sorted(replicas) != sorted(isr):
+            raise SystemExit(1)
+    elif mode == "post":
+        if sorted(replicas) != [0, 1, 2] or sorted(isr) != [0, 1, 2]:
+            raise SystemExit(1)
+    else:
+        raise SystemExit(f"unsupported mode: {mode}")
+PY
+}
+
+count_file_value() {
+  local path="$1"
+  [[ -f "${path}" ]] || return 1
+  tr -d '[:space:]' <"${path}"
+}
+
+capture_partition_count() {
+  local partition_id="$1"
+  local output_path="$2"
+  recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 bash -lc "
+    kafka-console-consumer \
+      --bootstrap-server kafka-0:9092 \
+      --topic '${TARGET_TOPIC}' \
+      --partition ${partition_id} \
+      --from-beginning \
+      --timeout-ms 20000 2>/dev/null | wc -l
+  " >"${output_path}"
+}
+
+upload_reassignment_payload() {
+  local local_payload_path="$1"
+  local remote_payload_path="$2"
+  recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 bash -lc "cat >'${remote_payload_path}'" <"${local_payload_path}"
+}
+
+execute_reassignment() {
+  local remote_payload_path="$1"
+  local output_path="$2"
+  recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 bash -lc "
+    if command -v kafka-reassign-partitions >/dev/null 2>&1; then
+      kafka-reassign-partitions --bootstrap-server kafka-0:9092 --reassignment-json-file '${remote_payload_path}' --execute
+    elif command -v kafka-reassign-partitions.sh >/dev/null 2>&1; then
+      kafka-reassign-partitions.sh --bootstrap-server kafka-0:9092 --reassignment-json-file '${remote_payload_path}' --execute
+    else
+      echo 'kafka-reassign-partitions command not found' >&2
+      exit 99
+    fi
+  " >"${output_path}" 2>&1
+}
+
+capture_recovery_state
+
+pre_describe_path="${topic_artifact_dir}/${TARGET_TOPIC}.pre.describe.txt"
+pre_normalized_path="${topic_artifact_dir}/${TARGET_TOPIC}.pre.normalized.json"
+pre_underrep_path="${reassignment_artifact_dir}/under-replicated.before.txt"
+
+capture_topic_describe "${pre_describe_path}"
+normalize_topic_describe "${pre_describe_path}" "${pre_normalized_path}"
+capture_under_replicated "${pre_underrep_path}"
+
+a1_details=()
+if ! check_topic_state "pre" "${pre_normalized_path}"; then
+  a1_details+=("pre-state-not-rf1")
+fi
+if [[ -s "${pre_underrep_path}" ]]; then
+  a1_details+=("pre-under-replicated=$(tr '\n' ' ' <"${pre_underrep_path}" | sed 's/[[:space:]]\+/ /g' | sed 's/ $//')")
+fi
+
+if [[ "${#a1_details[@]}" -eq 0 ]]; then
+  record_assertion "A1" "The recovered cluster settles cleanly into the intended RF=1 steady state" "PASS" "${topic_artifact_dir}" "target partitions 0,1,2 started with exactly one replica each and no pre-expansion under-replication"
+else
+  record_assertion "A1" "The recovered cluster settles cleanly into the intended RF=1 steady state" "FAIL" "${topic_artifact_dir}" "$(printf '%s; ' "${a1_details[@]}" | sed 's/; $//')"
+fi
+
+payload_path="${reassignment_artifact_dir}/reassignment.json"
+execute_output_path="${reassignment_artifact_dir}/execute.txt"
+remote_payload_path="/tmp/scenario-10-reassignment.json"
+python3 "${REPO_ROOT}/automation/lib/generate_reassignment_payload.py" \
+  --topic "${TARGET_TOPIC}" \
+  --partitions "${TARGET_PARTITIONS_CSV}" \
+  --replicas "${TARGET_REPLICAS_CSV}" \
+  --output "${payload_path}"
+
+expected_payload="$(jq -cn --arg topic "${TARGET_TOPIC}" '
+  {
+    version: 1,
+    partitions: [
+      {topic: $topic, partition: 0, replicas: [0,1,2]},
+      {topic: $topic, partition: 1, replicas: [0,1,2]},
+      {topic: $topic, partition: 2, replicas: [0,1,2]}
+    ]
+  }'
+)"
+a2_details=()
+actual_payload="$(jq -cS . "${payload_path}")"
+[[ "${actual_payload}" == "$(jq -cS . <<<"${expected_payload}")" ]] || a2_details+=("payload-mismatch=${actual_payload}")
+
+if ! upload_reassignment_payload "${payload_path}" "${remote_payload_path}"; then
+  a2_details+=("payload-upload-failed")
+fi
+
+if ! execute_reassignment "${remote_payload_path}" "${execute_output_path}"; then
+  a2_details+=("execute-failed")
+fi
+
+if [[ "${#a2_details[@]}" -eq 0 ]]; then
+  record_assertion "A2" "The deterministic reassignment payload is generated and accepted for execution" "PASS" "${reassignment_artifact_dir}" "the deterministic reassignment payload targeted recovery.default.6p partitions 0,1,2 with replicas [0,1,2] and Kafka accepted the execute request"
+else
+  record_assertion "A2" "The deterministic reassignment payload is generated and accepted for execution" "FAIL" "${reassignment_artifact_dir}" "$(printf '%s; ' "${a2_details[@]}" | sed 's/; $//')"
+fi
+
+post_describe_path="${topic_artifact_dir}/${TARGET_TOPIC}.post.describe.txt"
+post_normalized_path="${topic_artifact_dir}/${TARGET_TOPIC}.post.normalized.json"
+during_underrep_path="${reassignment_artifact_dir}/under-replicated.during.txt"
+final_underrep_path="${reassignment_artifact_dir}/under-replicated.after.txt"
+converged=0
+underrep_observed=0
+
+for attempt in $(seq 1 "${CONVERGENCE_ATTEMPTS}"); do
+  capture_topic_describe "${post_describe_path}"
+  normalize_topic_describe "${post_describe_path}" "${post_normalized_path}"
+  capture_under_replicated "${during_underrep_path}"
+  if [[ -s "${during_underrep_path}" ]]; then
+    underrep_observed=1
+  fi
+  if check_topic_state "post" "${post_normalized_path}" && [[ ! -s "${during_underrep_path}" ]]; then
+    converged=1
+    break
+  fi
+  sleep "${CONVERGENCE_SLEEP_SECONDS}"
+done
+
+capture_under_replicated "${final_underrep_path}"
+a3_details=()
+if [[ "${converged}" -ne 1 ]]; then
+  a3_details+=("final-state-not-converged")
+fi
+if ! check_topic_state "post" "${post_normalized_path}"; then
+  a3_details+=("post-state-not-rf3")
+fi
+if [[ -s "${final_underrep_path}" ]]; then
+  a3_details+=("persistent-under-replication=$(tr '\n' ' ' <"${final_underrep_path}" | sed 's/[[:space:]]\+/ /g' | sed 's/ $//')")
+fi
+
+if [[ "${#a3_details[@]}" -eq 0 ]]; then
+  if [[ "${underrep_observed}" -eq 1 ]]; then
+    detail_message="the target partitions converged to replicas and ISR [0,1,2], and transient under-replication was observed and then cleared"
+  else
+    detail_message="the target partitions converged to replicas and ISR [0,1,2], and no persistent under-replication remained"
+  fi
+  record_assertion "A3" "The expansion converges and does not leave persistent under-replication behind" "PASS" "${reassignment_artifact_dir}" "${detail_message}"
+else
+  record_assertion "A3" "The expansion converges and does not leave persistent under-replication behind" "FAIL" "${reassignment_artifact_dir}" "$(printf '%s; ' "${a3_details[@]}" | sed 's/; $//')"
+fi
+
+a4_details=()
+for partition_id in "${TARGET_PARTITIONS[@]}"; do
+  count_path="${sample_artifact_dir}/${TARGET_TOPIC}.p${partition_id}.count.txt"
+  capture_partition_count "${partition_id}" "${count_path}"
+  expected_offset="$(jq -r --arg partition "${partition_id}" '.topics[] | select(.name == "'"${TARGET_TOPIC}"'") | .expected_latest_offsets[$partition] // empty' "${snapshot_manifest_path}")"
+  actual_count="$(count_file_value "${count_path}" || printf 'missing')"
+  [[ -n "${expected_offset}" ]] || a4_details+=("partition-${partition_id}:missing-expected-offset")
+  [[ "${actual_count}" == "${expected_offset}" ]] || a4_details+=("partition-${partition_id}:expected=${expected_offset}:actual=${actual_count}")
+done
+
+if [[ "${#a4_details[@]}" -eq 0 ]]; then
+  record_assertion "A4" "Expanded partitions remain fully readable after reassignment" "PASS" "${sample_artifact_dir}" "post-expansion reads for partitions 0,1,2 matched the manifest-backed latest offsets"
+else
+  record_assertion "A4" "Expanded partitions remain fully readable after reassignment" "FAIL" "${sample_artifact_dir}" "$(printf '%s; ' "${a4_details[@]}" | sed 's/; $//')"
+fi
+
+status="pass"
+if [[ "${had_failure}" -ne 0 ]]; then
+  status="fail"
+fi
+
+jq -n \
+  --arg scenario "${scenario_id}" \
+  --arg run_id "${run_id}" \
+  --arg snapshot_label "${SNAPSHOT_LABEL}" \
+  --arg status "${status}" \
+  --arg generated_at "$(timestamp_utc)" \
+  '{
+    scenario: $scenario,
+    run_id: $run_id,
+    snapshot_label: $snapshot_label,
+    status: $status,
+    generated_at_utc: $generated_at,
+    assertions: [inputs]
+  }' "${assertions_jsonl_path}" >"${summary_path}"
+
+log "scenario 10 assert artifacts written to ${assert_dir}"

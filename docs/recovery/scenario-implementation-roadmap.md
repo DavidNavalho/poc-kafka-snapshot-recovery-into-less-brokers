@@ -23,6 +23,7 @@ This file is the current planning authority for:
 - Scenario 07 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T143125Z`.
 - Scenario 08 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T131900Z`.
 - Scenario 03 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T154928Z`.
+- Scenario 10 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T162030Z`.
 - Two important runtime issues were already found and fixed:
   - source and recovery clusters must not share the same Docker network namespace
   - copied metadata snapshot directories must be cleaned more aggressively before installing rewritten state
@@ -330,8 +331,9 @@ Done gate:
 
 Current status:
 
-- not automated yet
-- should wait until the base recovery and data checks are stable
+- implemented and validated from a fresh worktree
+- latest clean report: `docs/recovery/reports/runs/2026-04-21-scenario-10-20260421T162030Z.md`
+- deterministic reassignment payload generation, pre/post topic normalization, and post-expansion readability checks are now automated
 
 Spec before implementation:
 
@@ -348,7 +350,7 @@ Likely implementation focus:
 
 Done gate:
 
-- the recovered cluster settles with `Replicas` length `1`, targeted expansion to `[0,1,2]` completes, and temporary under-replication resolves
+- achieved on 2026-04-21 by run `20260421T162030Z`
 
 ### Scenario 11: End-To-End Automation Dry Run
 
