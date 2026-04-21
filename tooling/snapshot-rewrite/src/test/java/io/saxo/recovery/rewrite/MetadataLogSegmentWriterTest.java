@@ -29,13 +29,13 @@ class MetadataLogSegmentWriterTest {
     Path tempDir;
 
     @Test
-    void truncatesMetadataLogAtInclusiveSnapshotOffset() throws Exception {
+    void truncatesMetadataLogImmediatelyBeforeSnapshotEndOffset() throws Exception {
         Path input = tempDir.resolve("input.log");
         Path output = tempDir.resolve("00000000000000000000.log");
         MetadataLogSegmentWriterTestSupport support = new MetadataLogSegmentWriterTestSupport();
         support.writeSingleRecordBatches(input, 0L, noOp(), noOp(), noOp(), noOp(), noOp());
 
-        new MetadataLogSegmentWriter().writeTruncated(input, output, 2L);
+        new MetadataLogSegmentWriter().writeTruncated(input, output, 3L);
 
         assertEquals(List.of(0L, 1L, 2L), support.batchOffsets(output));
         assertTrue(Files.isRegularFile(sidecarPath(output, ".index")));
@@ -64,10 +64,23 @@ class MetadataLogSegmentWriterTest {
 
         RewriteException exception = assertThrows(
             RewriteException.class,
-            () -> new MetadataLogSegmentWriter().writeTruncated(input, output, 0L)
+            () -> new MetadataLogSegmentWriter().writeTruncated(input, output, 1L)
         );
 
-        assertEquals("snapshot offset 0 falls in the middle of metadata batch 0-1", exception.getMessage());
+        assertEquals("snapshot offset 1 falls in the middle of metadata batch 0-1", exception.getMessage());
+    }
+
+    @Test
+    void allowsSnapshotEndOffsetAtStartOfFirstBatch() throws Exception {
+        Path input = tempDir.resolve("input.log");
+        Path output = tempDir.resolve("output.log");
+        MetadataLogSegmentWriterTestSupport support = new MetadataLogSegmentWriterTestSupport();
+        support.writeBatch(input, 0L, noOp(), noOp());
+        support.writeBatch(input, 2L, noOp());
+
+        new MetadataLogSegmentWriter().writeTruncated(input, output, 0L);
+
+        assertTrue(support.batchOffsets(output).isEmpty());
     }
 
     @Test
@@ -85,8 +98,8 @@ class MetadataLogSegmentWriterTest {
 
         List<Long> offsets = support.batchOffsets(output);
         assertEquals(0L, offsets.getFirst());
-        assertEquals(8030L, offsets.getLast());
-        assertEquals(8030L, offsets.stream().mapToLong(Long::longValue).max().orElseThrow());
+        assertEquals(8029L, offsets.getLast());
+        assertEquals(8029L, offsets.stream().mapToLong(Long::longValue).max().orElseThrow());
     }
 
     @Test
@@ -99,18 +112,20 @@ class MetadataLogSegmentWriterTest {
         new MetadataLogSegmentWriter().rewrite(input, output, emptySnapshot(8030L), options(List.of(0, 1, 2)));
 
         List<MetadataLogSegmentWriterTestSupport.DecodedRecord> records = support.records(output);
-        assertEquals(List.of(8031L, 8032L), records.stream().map(MetadataLogSegmentWriterTestSupport.DecodedRecord::offset).toList());
+        assertEquals(List.of(8030L, 8031L, 8032L), records.stream().map(MetadataLogSegmentWriterTestSupport.DecodedRecord::offset).toList());
         assertInstanceOf(NoOpRecord.class, records.get(0).record().message());
         assertInstanceOf(NoOpRecord.class, records.get(1).record().message());
+        assertInstanceOf(NoOpRecord.class, records.get(2).record().message());
         assertTrue(Files.isRegularFile(sidecarPath(output, ".index")));
         assertTrue(Files.isRegularFile(sidecarPath(output, ".timeindex")));
         List<MetadataLogSegmentWriterTestSupport.BatchInfo> batches = support.batchInfos(output);
         assertEquals(
             List.of(
-                new OffsetIndexEntry(8031, 0),
-                new OffsetIndexEntry(8032, Math.toIntExact(batches.get(1).position()))
+                new OffsetIndexEntry(8030, 0),
+                new OffsetIndexEntry(8031, Math.toIntExact(batches.get(1).position())),
+                new OffsetIndexEntry(8032, Math.toIntExact(batches.get(2).position()))
             ),
-            readOffsetIndexEntries(sidecarPath(output, ".index"), 2)
+            readOffsetIndexEntries(sidecarPath(output, ".index"), 3)
         );
     }
 
@@ -130,8 +145,9 @@ class MetadataLogSegmentWriterTest {
         );
 
         List<MetadataLogSegmentWriterTestSupport.DecodedRecord> records = support.records(output);
-        assertEquals(List.of(8031L), records.stream().map(MetadataLogSegmentWriterTestSupport.DecodedRecord::offset).toList());
-        PartitionChangeRecord rewritten = assertInstanceOf(PartitionChangeRecord.class, records.get(0).record().message());
+        assertEquals(List.of(8030L, 8031L), records.stream().map(MetadataLogSegmentWriterTestSupport.DecodedRecord::offset).toList());
+        assertInstanceOf(NoOpRecord.class, records.get(0).record().message());
+        PartitionChangeRecord rewritten = assertInstanceOf(PartitionChangeRecord.class, records.get(1).record().message());
         assertEquals(List.of(0), rewritten.replicas());
         assertEquals(List.of(0), rewritten.isr());
         assertEquals(0, rewritten.leader());
@@ -154,7 +170,9 @@ class MetadataLogSegmentWriterTest {
         );
 
         List<MetadataLogSegmentWriterTestSupport.DecodedRecord> records = support.records(output);
-        PartitionChangeRecord rewritten = assertInstanceOf(PartitionChangeRecord.class, records.get(0).record().message());
+        assertEquals(List.of(8030L, 8031L), records.stream().map(MetadataLogSegmentWriterTestSupport.DecodedRecord::offset).toList());
+        assertInstanceOf(NoOpRecord.class, records.get(0).record().message());
+        PartitionChangeRecord rewritten = assertInstanceOf(PartitionChangeRecord.class, records.get(1).record().message());
         assertEquals(List.of(0), rewritten.replicas());
         assertEquals(List.of(0), rewritten.isr());
         assertEquals(0, rewritten.leader());

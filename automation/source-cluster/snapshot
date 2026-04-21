@@ -7,7 +7,7 @@ source "$(cd "$(dirname "$0")/.." && pwd -P)/lib/common.sh"
 require_cmd docker
 require_cmd jq
 
-snapshot_label="${1:-baseline-clean-v1}"
+snapshot_label="${1:-baseline-clean-v2}"
 snapshot_dir="${SNAPSHOTS_ROOT}/${snapshot_label}"
 
 [[ ! -e "${snapshot_dir}" ]] || fail "snapshot label already exists: ${snapshot_label}"

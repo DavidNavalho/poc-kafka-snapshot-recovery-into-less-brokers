@@ -67,15 +67,15 @@ final class MetadataLogSegmentWriter {
                     StandardOpenOption.WRITE
                 )
             ) {
-                long snapshotOffset = rewrittenSnapshot.snapshotId().offset();
+                long snapshotEndOffset = rewrittenSnapshot.snapshotId().offset();
                 for (FileChannelRecordBatch batch : inputRecords.batches()) {
                     batch.ensureValid();
-                    if (batch.lastOffset() <= snapshotOffset) {
+                    if (batch.lastOffset() < snapshotEndOffset) {
                         continue;
                     }
-                    if (batch.baseOffset() <= snapshotOffset) {
+                    if (batch.baseOffset() < snapshotEndOffset) {
                         throw new RewriteException(
-                            "snapshot offset " + snapshotOffset +
+                            "snapshot offset " + snapshotEndOffset +
                                 " falls in the middle of metadata batch " +
                                 batch.baseOffset() + "-" + batch.lastOffset()
                         );
@@ -93,7 +93,7 @@ final class MetadataLogSegmentWriter {
         }
     }
 
-    void writeTruncated(Path inputLogPath, Path outputLogPath, long maxOffsetInclusive) {
+    void writeTruncated(Path inputLogPath, Path outputLogPath, long snapshotEndOffset) {
         Path normalizedInput = inputLogPath.toAbsolutePath().normalize();
         Path normalizedOutput = outputLogPath.toAbsolutePath().normalize();
         Path outputDir = normalizedOutput.getParent();
@@ -121,16 +121,16 @@ final class MetadataLogSegmentWriter {
 
                 for (FileChannelRecordBatch batch : inputRecords.batches()) {
                     batch.ensureValid();
-                    if (batch.lastOffset() <= maxOffsetInclusive) {
+                    if (batch.lastOffset() < snapshotEndOffset) {
                         writeRawBatch(batch, outputChannel);
                         lastRetainedOffset = batch.lastOffset();
                         continue;
                     }
 
                     sawHigherOffset = true;
-                    if (batch.baseOffset() <= maxOffsetInclusive) {
+                    if (batch.baseOffset() < snapshotEndOffset) {
                         throw new RewriteException(
-                            "snapshot offset " + maxOffsetInclusive +
+                            "snapshot offset " + snapshotEndOffset +
                                 " falls in the middle of metadata batch " +
                                 batch.baseOffset() + "-" + batch.lastOffset()
                         );
@@ -138,13 +138,14 @@ final class MetadataLogSegmentWriter {
                     break;
                 }
 
-                if (lastRetainedOffset != maxOffsetInclusive) {
+                long expectedLastRetainedOffset = snapshotEndOffset - 1;
+                if (lastRetainedOffset != expectedLastRetainedOffset) {
                     String detail = sawHigherOffset
                         ? "last retained offset was " + lastRetainedOffset
                         : "metadata log ended at offset " + lastRetainedOffset;
                     throw new RewriteException(
-                        "metadata log truncation did not land on snapshot offset " +
-                            maxOffsetInclusive + ": " + detail
+                        "metadata log truncation did not land immediately before snapshot offset " +
+                            snapshotEndOffset + ": " + detail
                     );
                 }
                 outputChannel.force(true);

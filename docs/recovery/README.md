@@ -38,6 +38,7 @@ Prove feasibility with a deterministic, resource-conscious harness:
 - [Scenario Implementation Roadmap](./scenario-implementation-roadmap.md)
 - [Handoff](./HANDOFF.md)
 - [Scenario Index](./scenarios/README.md)
+- [Scenario Report Cards](./scenarios/report-cards/README.md)
 - [Manual Runbooks](./manual-runbooks/README.md)
 - [Reports](./reports/README.md)
 - [TODO Tracker](./TODO.md)

@@ -18,7 +18,7 @@ fixture_json_file="${artifact_dir}/fixture.json"
 ensure_dir "${artifact_dir}"
 ensure_dir "${open_txn_dir}"
 
-toolbox_python "${REPO_ROOT}/automation/lib/source_fixture.py" fixture-json >"${fixture_json_file}"
+source_toolbox_python "${REPO_ROOT}/automation/lib/source_fixture.py" fixture-json >"${fixture_json_file}"
 fixture_json="$(cat "${fixture_json_file}")"
 
 create_topic() {
@@ -56,7 +56,7 @@ produce_fixed_topic() {
   count="$(jq -r '.seed_plan.messages_per_partition' <<<"${topic_json}")"
   for partition in $(seq 0 $((partitions - 1))); do
     log "producing ${count} records to ${name} partition ${partition}"
-    toolbox_python "${REPO_ROOT}/automation/lib/seed_plain_records.py" fixed \
+    source_toolbox_python "${REPO_ROOT}/automation/lib/seed_plain_records.py" fixed \
       --bootstrap-server kafka-0:9092 \
       --topic "${name}" \
       --partition "${partition}" \
@@ -77,7 +77,7 @@ produce_compacted_topic() {
   versions_per_key="$(jq -r '.seed_plan.versions_per_key' <<<"${topic_json}")"
   for partition in $(seq 0 $((partitions - 1))); do
     log "producing compacted records to ${name} partition ${partition}"
-    toolbox_python "${REPO_ROOT}/automation/lib/seed_plain_records.py" compacted \
+    source_toolbox_python "${REPO_ROOT}/automation/lib/seed_plain_records.py" compacted \
       --bootstrap-server kafka-0:9092 \
       --topic "${name}" \
       --partition "${partition}" \
@@ -106,7 +106,7 @@ seed_transactions() {
   touch "${hold_file}"
 
   log "producing committed transactions for ${topic}"
-  toolbox_python "${REPO_ROOT}/automation/lib/seed_transactions.py" committed \
+  source_toolbox_python "${REPO_ROOT}/automation/lib/seed_transactions.py" committed \
     --bootstrap-server kafka-0:9092 \
     --topic "${topic}" \
     --partitions "${partitions}" \
@@ -116,7 +116,7 @@ seed_transactions() {
     >"${artifact_dir}/transactions-committed.log" 2>&1
 
   log "opening in-flight transaction for ${topic}"
-  toolbox_python "${REPO_ROOT}/automation/lib/seed_transactions.py" open \
+  source_toolbox_python "${REPO_ROOT}/automation/lib/seed_transactions.py" open \
     --bootstrap-server kafka-0:9092 \
     --topic "${topic}" \
     --partitions "${partitions}" \
@@ -140,12 +140,29 @@ create_consumer_groups() {
     topic="$(jq -r '.topic' <<<"${group_json}")"
     offset="$(jq -r '.expected_committed_offsets["0"]' <<<"${group_json}")"
     log "setting consumer group ${group_id} offsets to ${offset} for ${topic}"
-    toolbox_python "${REPO_ROOT}/automation/lib/seed_consumer_group_offsets.py" commit \
+    source_toolbox_python "${REPO_ROOT}/automation/lib/seed_consumer_group_offsets.py" commit \
       --bootstrap-server kafka-0:9092 \
       --group-id "${group_id}" \
       --topic "${topic}" \
       --offset "${offset}"
   done < <(jq -c '.consumer_groups[]' <<<"${fixture_json}")
+}
+
+apply_broker_dynamic_configs() {
+  while IFS= read -r broker_json; do
+    local broker_id config_entries
+    broker_id="$(jq -r '.broker_id' <<<"${broker_json}")"
+    config_entries="$(jq -r '.configs | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"${broker_json}")"
+    [[ -n "${config_entries}" ]] || continue
+    log "applying dynamic broker configs to broker ${broker_id}: ${config_entries}"
+    source_compose exec -T kafka-0 \
+      kafka-configs \
+      --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" \
+      --entity-type brokers \
+      --entity-name "${broker_id}" \
+      --alter \
+      --add-config "${config_entries}" </dev/null
+  done < <(jq -c '.broker_dynamic_configs[]?' <<<"${fixture_json}")
 }
 
 while IFS= read -r topic_json; do
@@ -171,6 +188,7 @@ while IFS= read -r topic_json; do
 done < <(jq -c '.topics[]' <<<"${fixture_json}")
 
 create_consumer_groups
+apply_broker_dynamic_configs
 
 log "source fixture seeded; artifact directory: ${artifact_dir}"
 log "open transaction helper state directory: ${open_txn_dir}"

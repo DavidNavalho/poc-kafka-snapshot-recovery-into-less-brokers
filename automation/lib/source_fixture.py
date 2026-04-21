@@ -157,7 +157,7 @@ BROKER_DYNAMIC_CONFIGS = [
     {
         "broker_id": 0,
         "configs": {
-            "log.retention.hours": "48",
+            "log.cleaner.threads": "2",
         },
     }
 ]
@@ -208,7 +208,9 @@ def _topic_entry(topic: dict) -> dict:
         entry["seed_plan"]["messages_in_ongoing_transaction"] = topic[
             "messages_in_ongoing_transaction"
         ]
-        entry["expected_latest_offsets"] = _partition_map(topic["partitions"], 101)
+        # Committed transaction control markers consume offsets, but the in-flight
+        # transaction has not emitted its terminal marker at clean-stop time.
+        entry["expected_latest_offsets"] = _partition_map(topic["partitions"], 201)
         entry["expected_read_committed_offsets"] = _partition_map(topic["partitions"], 100)
     else:
         raise ValueError(f"unsupported generator {topic['generator']}")

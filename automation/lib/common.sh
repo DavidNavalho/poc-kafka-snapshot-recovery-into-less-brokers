@@ -229,9 +229,8 @@ render_source_configs() {
       "/var/lib/kafka/data-1" \
       "false" \
       ""
-    if [[ "${broker_id}" == "0" ]]; then
-      printf 'log.retention.hours=48\n' >>"$(source_broker_dir "${broker_id}")/rendered-config/server.properties"
-    fi
+    printf 'metadata.log.max.record.bytes.between.snapshots=1024\n' >>"$(source_broker_dir "${broker_id}")/rendered-config/server.properties"
+    printf 'metadata.log.max.snapshot.interval.ms=1000\n' >>"$(source_broker_dir "${broker_id}")/rendered-config/server.properties"
   done
 }
 
@@ -296,6 +295,13 @@ ensure_toolbox_image() {
 
 
 toolbox_python() {
+  toolbox_python_with_network "${HARNESS_NETWORK}" "$@"
+}
+
+
+toolbox_python_with_network() {
+  local network_name="$1"
+  shift
   local -a docker_args
   ensure_toolbox_image
   docker_args=(
@@ -305,10 +311,15 @@ toolbox_python() {
     -v "${REPO_ROOT}:${REPO_ROOT}"
     -w "${REPO_ROOT}"
   )
-  if docker network inspect "${HARNESS_NETWORK}" >/dev/null 2>&1; then
-    docker_args+=(--network "${HARNESS_NETWORK}")
+  if docker network inspect "${network_name}" >/dev/null 2>&1; then
+    docker_args+=(--network "${network_name}")
   fi
   docker "${docker_args[@]}" "${TOOLBOX_IMAGE}" python3 "$@"
+}
+
+
+source_toolbox_python() {
+  toolbox_python_with_network "${SOURCE_PROJECT}_harness" "$@"
 }
 
 

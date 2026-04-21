@@ -165,8 +165,9 @@ class RewriteCliTest {
         assertTrue(stdout.toString().contains("rewrote metadata log to"));
         assertEquals("", stderr.toString());
         List<MetadataLogSegmentWriterTestSupport.DecodedRecord> rewrittenRecords = support.records(metadataOutput);
-        assertEquals(List.of(8031L), rewrittenRecords.stream().map(MetadataLogSegmentWriterTestSupport.DecodedRecord::offset).toList());
+        assertEquals(List.of(8030L, 8031L), rewrittenRecords.stream().map(MetadataLogSegmentWriterTestSupport.DecodedRecord::offset).toList());
         assertTrue(rewrittenRecords.get(0).record().message() instanceof NoOpRecord);
+        assertTrue(rewrittenRecords.get(1).record().message() instanceof NoOpRecord);
     }
 
     private Path writeCheckpoint(String fileName, String content) throws IOException {

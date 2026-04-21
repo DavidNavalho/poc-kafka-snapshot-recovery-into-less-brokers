@@ -32,23 +32,24 @@ for broker_id in 0 1 2; do
   ensure_dir "${workdir}/brokers/broker-${broker_id}/data-root"
 done
 
-source_metadata_log_path=""
+quorum_state_json "$(metadata_snapshot_dir "${workdir}/brokers/broker-0/metadata")/quorum-state" >"${workdir}/artifacts/prepare/quorum-state.json"
+checkpoint_json_for_root "${workdir}/brokers" >"${workdir}/artifacts/prepare/selected-checkpoint.json"
+selected_checkpoint_path="$(jq -r '.path' "${workdir}/artifacts/prepare/selected-checkpoint.json")"
+selected_broker_id="$(sed -E 's@.*/broker-([0-9]+)/.*@\1@' <<<"${selected_checkpoint_path}")"
+[[ "${selected_broker_id}" =~ ^[0-9]+$ ]] || fail "unable to determine selected checkpoint broker from path: ${selected_checkpoint_path}"
+
+source_metadata_log_path="$(metadata_snapshot_dir "${workdir}/brokers/broker-${selected_broker_id}/metadata")/00000000000000000000.log"
+[[ -f "${source_metadata_log_path}" ]] || fail "copied source metadata log missing for selected checkpoint broker ${selected_broker_id}: ${source_metadata_log_path}"
+cp "${source_metadata_log_path}" "${source_metadata_log_artifact}"
+
 for broker_id in 0 1 2; do
   candidate_metadata_log_path="$(metadata_snapshot_dir "${workdir}/brokers/broker-${broker_id}/metadata")/00000000000000000000.log"
   [[ -f "${candidate_metadata_log_path}" ]] || fail "copied source metadata log missing for broker ${broker_id}: ${candidate_metadata_log_path}"
-  if [[ -z "${source_metadata_log_path}" ]]; then
-    source_metadata_log_path="${candidate_metadata_log_path}"
-    continue
-  fi
-  if ! cmp -s "${source_metadata_log_path}" "${candidate_metadata_log_path}"; then
-    fail "surviving source metadata logs differ between copied brokers; per-broker metadata log rewrite is not implemented"
+  if [[ "${broker_id}" != "${selected_broker_id}" ]] && ! cmp -s "${source_metadata_log_path}" "${candidate_metadata_log_path}"; then
+    log "source metadata log for broker ${broker_id} differs from selected checkpoint broker ${selected_broker_id}; using broker ${selected_broker_id} as the canonical rewrite source"
   fi
 done
 
-cp "${source_metadata_log_path}" "${source_metadata_log_artifact}"
-
-quorum_state_json "$(metadata_snapshot_dir "${workdir}/brokers/broker-0/metadata")/quorum-state" >"${workdir}/artifacts/prepare/quorum-state.json"
-checkpoint_json_for_root "${workdir}/brokers" >"${workdir}/artifacts/prepare/selected-checkpoint.json"
 render_recovery_configs "${workdir}"
 
 for broker_id in 0 1 2; do

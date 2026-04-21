@@ -27,6 +27,7 @@ This file is the authoritative source for:
   - rack-c: `6,7,8`
 - 2 `log.dirs` per broker from day one
 - dedicated `metadata.log.dir` per broker
+- source brokers statically lower metadata snapshot thresholds so the fixture emits a KRaft metadata checkpoint that the recovery harness can rewrite deterministically
 
 Using two log directories from the beginning keeps the harness aligned with the multi-log-dir scenario without needing a second source-cluster flavor.
 
@@ -80,7 +81,7 @@ Every partition in `recovery.consumer.test` must have the same committed offset 
 
 ### Pinned Dynamic Overrides
 
-- Broker `0` must have the dynamic broker config override `log.retention.hours=48`.
+- Broker `0` must have the dynamic broker config override `log.cleaner.threads=2`.
 - Topic-level dynamic configs must exactly match the values listed in the baseline topic table above.
 
 ### Approximate Baseline Footprint
@@ -110,8 +111,8 @@ Required top-level shape:
 ```json
 {
   "schema_version": 1,
-  "snapshot_label": "baseline-clean-v1",
-  "source_fixture_version": "baseline-clean-v1",
+  "snapshot_label": "baseline-clean-v2",
+  "source_fixture_version": "baseline-clean-v2",
   "created_at_utc": "YYYY-MM-DDTHH:MM:SSZ",
   "image": {
     "vendor": "confluentinc",
@@ -179,7 +180,7 @@ Additional required topic-entry rules:
   - `messages_per_transaction = 6`
   - `ongoing_transaction_count = 1`
   - `messages_in_ongoing_transaction = 6`
-  - `expected_latest_offsets` of `101` for each partition
+  - `expected_latest_offsets` of `201` for each partition because committed transaction control markers advance the log end offset, while the in-flight transaction contributes one uncommitted data batch but no terminal control marker at clean-stop time
   - `expected_read_committed_offsets` of `100` for each partition
 
 ### Consumer Group Entry Schema
@@ -205,7 +206,7 @@ Each `broker_dynamic_configs[]` entry must contain:
 {
   "broker_id": 0,
   "configs": {
-    "log.retention.hours": "48"
+    "log.cleaner.threads": "2"
   }
 }
 ```
@@ -247,9 +248,14 @@ No scenario automation should infer compacted latest values implicitly when the 
 Planned labels:
 
 - `baseline-clean-v1`
+- `baseline-clean-v2`
 - `baseline-live-v1` for the deferred live-snapshot scenario
 
-If a scenario needs materially different source data, create a new snapshot label instead of mutating `baseline-clean-v1`.
+`baseline-clean-v1` remains the original clean-stop fixture used by Scenario 01 and Scenario 02.
+
+`baseline-clean-v2` is the corrected clean-stop fixture revision for config-preservation coverage. It removes the accidental static broker retention override and records a real dynamic broker override on broker `0`.
+
+If a scenario needs materially different source data, create a new snapshot label instead of mutating an existing fixture revision.
 
 ## Reuse Rules
 

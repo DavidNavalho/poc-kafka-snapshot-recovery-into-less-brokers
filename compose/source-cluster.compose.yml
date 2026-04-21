@@ -38,7 +38,8 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_DELETE_TOPIC_ENABLE: "true"
-      KAFKA_LOG_RETENTION_HOURS: 48
+      KAFKA_METADATA_LOG_MAX_RECORD_BYTES_BETWEEN_SNAPSHOTS: 1024
+      KAFKA_METADATA_LOG_MAX_SNAPSHOT_INTERVAL_MS: 1000
     volumes: &source-volumes-0
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-0/data-root:/var/lib/kafka/data
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-0/metadata:/var/lib/kafka/metadata
@@ -55,7 +56,6 @@ services:
       KAFKA_NODE_ID: 1
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-1:9092,EXTERNAL://localhost:19093
       KAFKA_BROKER_RACK: rack-a
-      KAFKA_LOG_RETENTION_HOURS: null
     volumes:
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-1/data-root:/var/lib/kafka/data
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-1/metadata:/var/lib/kafka/metadata
@@ -72,7 +72,6 @@ services:
       KAFKA_NODE_ID: 2
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-2:9092,EXTERNAL://localhost:19094
       KAFKA_BROKER_RACK: rack-a
-      KAFKA_LOG_RETENTION_HOURS: null
     volumes:
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-2/data-root:/var/lib/kafka/data
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-2/metadata:/var/lib/kafka/metadata
@@ -89,7 +88,6 @@ services:
       KAFKA_NODE_ID: 3
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-3:9092,EXTERNAL://localhost:19095
       KAFKA_BROKER_RACK: rack-b
-      KAFKA_LOG_RETENTION_HOURS: null
     volumes:
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-3/data-root:/var/lib/kafka/data
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-3/metadata:/var/lib/kafka/metadata
@@ -106,7 +104,6 @@ services:
       KAFKA_NODE_ID: 4
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-4:9092,EXTERNAL://localhost:19096
       KAFKA_BROKER_RACK: rack-b
-      KAFKA_LOG_RETENTION_HOURS: null
     volumes:
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-4/data-root:/var/lib/kafka/data
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-4/metadata:/var/lib/kafka/metadata
@@ -123,7 +120,6 @@ services:
       KAFKA_NODE_ID: 5
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-5:9092,EXTERNAL://localhost:19097
       KAFKA_BROKER_RACK: rack-b
-      KAFKA_LOG_RETENTION_HOURS: null
     volumes:
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-5/data-root:/var/lib/kafka/data
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-5/metadata:/var/lib/kafka/metadata
@@ -140,7 +136,6 @@ services:
       KAFKA_NODE_ID: 6
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-6:9092,EXTERNAL://localhost:19098
       KAFKA_BROKER_RACK: rack-c
-      KAFKA_LOG_RETENTION_HOURS: null
     volumes:
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-6/data-root:/var/lib/kafka/data
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-6/metadata:/var/lib/kafka/metadata
@@ -157,7 +152,6 @@ services:
       KAFKA_NODE_ID: 7
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-7:9092,EXTERNAL://localhost:19099
       KAFKA_BROKER_RACK: rack-c
-      KAFKA_LOG_RETENTION_HOURS: null
     volumes:
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-7/data-root:/var/lib/kafka/data
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-7/metadata:/var/lib/kafka/metadata
@@ -174,7 +168,6 @@ services:
       KAFKA_NODE_ID: 8
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-8:9092,EXTERNAL://localhost:19100
       KAFKA_BROKER_RACK: rack-c
-      KAFKA_LOG_RETENTION_HOURS: null
     volumes:
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-8/data-root:/var/lib/kafka/data
       - ${REPO_ROOT:?set REPO_ROOT}/fixtures/source-cluster/live/broker-8/metadata:/var/lib/kafka/metadata

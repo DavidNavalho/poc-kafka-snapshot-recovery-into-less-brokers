@@ -35,9 +35,9 @@ source_compose exec -T kafka-0 \
   --bootstrap-server "${SOURCE_BOOTSTRAP_SERVER}" \
   --entity-type brokers \
   --entity-name 0 \
-  --describe \
-  --all </dev/null >"${artifact_dir}/broker-0-config.txt"
-grep -q 'log.retention.hours=48' "${artifact_dir}/broker-0-config.txt" || fail "broker 0 retention config missing"
+  --describe </dev/null >"${artifact_dir}/broker-0-config.txt"
+grep -q '^Dynamic configs for broker 0 are:$' "${artifact_dir}/broker-0-config.txt" || fail "broker 0 dynamic config header missing"
+grep -q 'log.cleaner.threads=2' "${artifact_dir}/broker-0-config.txt" || fail "broker 0 dynamic log cleaner config missing"
 
 while IFS= read -r topic_json; do
   topic_name="$(jq -r '.name' <<<"${topic_json}")"
@@ -86,8 +86,8 @@ while IFS= read -r group_json; do
     --describe \
     --group "${group_id}" </dev/null >"${group_file}"
   while IFS=' ' read -r partition expected_offset; do
-    awk -v topic="${topic_name}" -v partition="${partition}" -v offset="${expected_offset}" '
-      $1 == topic && $2 == partition && $3 == offset { found = 1 }
+    awk -v group="${group_id}" -v topic="${topic_name}" -v partition="${partition}" -v offset="${expected_offset}" '
+      $1 == group && $2 == topic && $3 == partition && $4 == offset { found = 1 }
       END { exit(found ? 0 : 1) }
     ' "${group_file}" || fail "unexpected committed offset for ${group_id} partition ${partition}"
   done < <(jq -r '.expected_committed_offsets | to_entries[] | "\(.key) \(.value)"' <<<"${group_json}")

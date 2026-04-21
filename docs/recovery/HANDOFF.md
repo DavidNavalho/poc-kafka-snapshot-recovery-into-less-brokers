@@ -16,9 +16,10 @@ The repo is no longer spec-only. The current state is:
 - the snapshot rewrite tool exists behind `bin/snapshot-rewrite-tool` and is implemented under `tooling/snapshot-rewrite/`
 - Scenario 01 is fully automated and passed cleanly on 2026-04-21 with run ID `20260421T084355Z`
 - Scenario 02 is fully automated and passed cleanly on 2026-04-21 with run ID `20260421T095313Z`
+- Scenario 05 is fully automated and passed cleanly on 2026-04-21 with run ID `20260421T113800Z`
 - the harness now supports worktree-friendly root overrides so scenario work can run from a dedicated Git worktree while still pointing at shared snapshot artifacts
 
-Use [`scenario-implementation-roadmap.md`](./scenario-implementation-roadmap.md) as the authoritative execution plan. Scenario 01 and Scenario 02 are now the completed anchors; Scenario 05 is the next implementation target.
+Use [`scenario-implementation-roadmap.md`](./scenario-implementation-roadmap.md) as the authoritative execution plan. Scenario 01, Scenario 02, and Scenario 05 are now the completed anchors; Scenario 08 is the next implementation target.
 
 ## Implemented Files
 
@@ -60,10 +61,13 @@ Use [`scenario-implementation-roadmap.md`](./scenario-implementation-roadmap.md)
 
 - `automation/tests/common_roots_override_test.sh`
 - `automation/tests/rewrite_cleanup_test.sh`
+- `automation/tests/source_render_configs_test.sh`
 - `automation/tests/scenario_01_assert_test.sh`
 - `automation/tests/scenario_01_report_test.sh`
 - `automation/tests/scenario_02_assert_test.sh`
 - `automation/tests/scenario_02_report_test.sh`
+- `automation/tests/scenario_05_assert_test.sh`
+- `automation/tests/scenario_05_report_test.sh`
 - `automation/tests/compose_network_isolation_test.sh`
 
 ## What The Current Automation Does
@@ -120,6 +124,13 @@ These checks were completed successfully:
   - `automation/recovery/up scenario-02 20260421T095313Z`
   - `automation/scenarios/scenario-02/assert 20260421T095313Z`
   - `automation/scenarios/scenario-02/report 20260421T095313Z`
+- containerized `tooling/snapshot-rewrite` Maven test suite after the Scenario 05 metadata-log boundary fix
+- real Scenario 05 recovery boot, assert, and report after:
+  - `automation/recovery/prepare scenario-05 baseline-clean-v2 20260421T113800Z`
+  - `automation/recovery/rewrite scenario-05 20260421T113800Z`
+  - `automation/recovery/up scenario-05 20260421T113800Z`
+  - `automation/scenarios/scenario-05/assert 20260421T113800Z`
+  - `automation/scenarios/scenario-05/report 20260421T113800Z`
 
 Important runtime detail:
 
@@ -129,7 +140,7 @@ Important runtime detail:
 
 ## Known Gaps
 
-- Scenarios 03 through 08, 10, 11, and 12 are still planned work
+- Scenarios 03, 04, 06, 07, 08, 10, 11, and 12 are still planned work
 - Scenario 03 still needs an explicit, reproducible fault-injection mechanism
 - Scenario 07 still needs a no-host-dependency transactional probe
 - Scenario 11 and Scenario 12 still need a report bundle convention and normalized diff strategy
@@ -143,6 +154,9 @@ Important runtime detail:
 - rewritten metadata logs now regenerate Kafka `.index` and `.timeindex` sidecars
 - ELR state is now cleared during checkpoint and metadata-log rewrite so recovered controllers do not emit overlapping `ISR`/`ELR` errors
 - worktree-based runs can point at shared snapshots via `SNAPSHOTS_ROOT`, and `prepare` now stages the source metadata log locally so `rewrite` stays container-safe even when the snapshots live outside the worktree
+- the source fixture now lowers metadata snapshot thresholds so clean-stop snapshots reliably include real KRaft `.checkpoint` files
+- metadata-log rewrite now treats checkpoint offsets as Kafka snapshot end offsets, so batches whose `baseOffset` equals the checkpoint boundary are preserved instead of rejected
+- `prepare` now treats the broker that owns the selected checkpoint as the canonical metadata-log source when copied surviving brokers disagree byte-for-byte
 
 These fixes matter because an earlier shared-network setup allowed recovery brokers to resolve source-cluster hostnames and join the wrong Raft peer, which looked like mysterious epoch jumps rather than an obvious wiring failure.
 
@@ -153,7 +167,7 @@ From repo root:
 ```bash
 sed -n '1,220p' AGENTS.md
 sed -n '1,260p' docs/recovery/scenario-implementation-roadmap.md
-sed -n '1,220p' docs/recovery/scenarios/scenario-05-config-preservation.md
+sed -n '1,220p' docs/recovery/scenarios/scenario-08-multiple-log-directories.md
 ```
 
 The latest green reports are:
@@ -161,14 +175,13 @@ The latest green reports are:
 ```bash
 sed -n '1,220p' docs/recovery/reports/runs/2026-04-21-scenario-01-20260421T084355Z.md
 sed -n '1,220p' docs/recovery/reports/runs/2026-04-21-scenario-02-20260421T095313Z.md
+sed -n '1,220p' docs/recovery/reports/runs/2026-04-21-scenario-05-20260421T113800Z.md
 ```
 
 Then resume from the next scenario:
 
 ```bash
-SNAPSHOTS_ROOT=<shared-snapshots-root> automation/recovery/prepare scenario-05 baseline-clean-v1
-automation/recovery/rewrite scenario-05 <run-id>
-automation/recovery/up scenario-05 <run-id>
+sed -n '1,260p' docs/recovery/scenarios/scenario-08-multiple-log-directories.md
 ```
 
 `<run-id>` is written into `fixtures/scenario-runs/<scenario-id>/<run-id>/run.env` by `automation/recovery/prepare`.
@@ -192,10 +205,11 @@ automation/recovery/up scenario-05 <run-id>
 - `docs/recovery/source-fixture-spec.md`
 - `docs/recovery/rewrite-tool-spec.md`
 - `docs/recovery/scenarios/scenario-01-quorum-and-metadata.md`
+- `docs/recovery/scenarios/scenario-05-config-preservation.md`
 - `final-recovery-plan.md`
 
 ## Git Notes
 
-- current branch in the active Scenario 02 worktree: `scenario-02`
+- current branch in the active Scenario 05 worktree: `scenario-05`
 - remote: `origin`
 - local `.claude/` contains Claude worktree metadata and should stay out of normal repo commits

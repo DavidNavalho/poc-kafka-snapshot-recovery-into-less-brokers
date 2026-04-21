@@ -17,6 +17,7 @@ This file is the current planning authority for:
 - The snapshot rewrite tool now exists behind [`bin/snapshot-rewrite-tool`](../../bin/snapshot-rewrite-tool) with implementation under [`tooling/snapshot-rewrite/`](../../tooling/snapshot-rewrite/).
 - Scenario 01 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh copied snapshot workdir.
 - Scenario 02 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T095313Z`.
+- Scenario 05 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T113800Z`.
 - Two important runtime issues were already found and fixed:
   - source and recovery clusters must not share the same Docker network namespace
   - copied metadata snapshot directories must be cleaned more aggressively before installing rewritten state
@@ -24,6 +25,9 @@ This file is the current planning authority for:
   - rewritten metadata logs must ship Kafka `.index` and `.timeindex` sidecars
   - recovery metadata directories must receive `leader-epoch-checkpoint` and a rewritten `quorum-state`
   - recovered partition metadata must clear ELR state instead of filtering it to surviving brokers
+- Scenario 05 uncovered and fixed two more shared assumptions:
+  - source fixture snapshots must emit real KRaft `.checkpoint` files, so the source fixture now forces lower metadata snapshot thresholds
+  - rewritten metadata logs must treat checkpoint offsets as Kafka snapshot end offsets, not inclusive retained offsets
 - Shared harness roots now honor explicit overrides, and `prepare` stages the source metadata log into the scenario workdir so worktree-based runs do not require direct container access to snapshot files outside the mounted repo root.
 - Scenario docs may still lag reality. Until they are refreshed one by one, use this roadmap as the authoritative planning view.
 
@@ -171,8 +175,9 @@ Done gate:
 
 Current status:
 
-- not automated yet
-- likely low-risk once Scenario 01 metadata checks are reusable
+- implemented and validated from a fresh worktree
+- latest clean report: `docs/recovery/reports/runs/2026-04-21-scenario-05-20260421T113800Z.md`
+- manifest-backed dynamic topic config equality and broker override preservation are now automated
 
 Spec before implementation:
 
@@ -186,9 +191,13 @@ Likely implementation focus:
 - broker config inspection helper
 - exact comparison logic for dynamic topic and broker configs
 
-Done gate:
+Success contract:
 
 - configured dynamic topic and broker overrides match the manifest exactly and no unintended overrides appear
+
+Done gate:
+
+- achieved on 2026-04-21 by run `20260421T113800Z`
 
 ### Scenario 08: Multiple Log Directories
 

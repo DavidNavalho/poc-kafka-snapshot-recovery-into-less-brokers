@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+require_cmd docker
+require_cmd jq
+
+scenario_id="scenario-05"
+run_id="${1:-}"
+
+[[ -n "${run_id}" ]] || fail "usage: automation/scenarios/scenario-05/assert <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+export RECOVERY_WORKDIR="${WORKDIR}"
+
+assert_dir="${WORKDIR}/artifacts/assert"
+topic_artifact_dir="${assert_dir}/topics"
+broker_artifact_dir="${assert_dir}/brokers"
+recovery_artifact_dir="${WORKDIR}/artifacts/recovery"
+recovery_log_path="${recovery_artifact_dir}/docker-compose.log"
+recovery_ps_path="${assert_dir}/recovery-ps.txt"
+assertions_jsonl_path="${assert_dir}/assertions.jsonl"
+summary_path="${assert_dir}/assert-summary.json"
+snapshot_manifest_path="${WORKDIR}/snapshot-manifest.json"
+
+ensure_dir "${assert_dir}"
+ensure_dir "${topic_artifact_dir}"
+ensure_dir "${broker_artifact_dir}"
+ensure_dir "${recovery_artifact_dir}"
+: >"${assertions_jsonl_path}"
+
+readonly CONFIGURED_TOPICS=(
+  "recovery.retention.short"
+  "recovery.retention.long"
+  "recovery.compacted.accounts"
+  "recovery.compacted.orders"
+  "recovery.compressed.zstd"
+)
+
+readonly ZERO_OVERRIDE_TOPICS=(
+  "recovery.default.6p"
+  "recovery.default.12p"
+  "recovery.default.24p"
+  "recovery.txn.test"
+  "recovery.consumer.test"
+)
+
+had_failure=0
+
+record_assertion() {
+  local id="$1"
+  local name="$2"
+  local result="$3"
+  local evidence="$4"
+  local details="$5"
+
+  if [[ "${result}" != "PASS" ]]; then
+    had_failure=1
+  fi
+
+  jq -nc \
+    --arg id "${id}" \
+    --arg name "${name}" \
+    --arg result "${result}" \
+    --arg evidence "${evidence}" \
+    --arg details "${details}" \
+    '{id: $id, name: $name, result: $result, evidence: $evidence, details: $details}' >>"${assertions_jsonl_path}"
+}
+
+capture_recovery_state() {
+  recovery_compose "${RECOVERY_PROJECT}" logs --no-color >"${recovery_log_path}" || true
+  recovery_compose "${RECOVERY_PROJECT}" ps >"${recovery_ps_path}" || true
+}
+
+manifest_topic_json() {
+  local topic_name="$1"
+  jq -cer --arg topic "${topic_name}" '.topics[] | select(.name == $topic)' "${snapshot_manifest_path}"
+}
+
+expected_topic_configs_json() {
+  local topic_name="$1"
+  manifest_topic_json "${topic_name}" | jq -cS '.configs // {}'
+}
+
+expected_broker_configs_json() {
+  local broker_id="$1"
+  jq -cS --argjson broker_id "${broker_id}" '([.broker_dynamic_configs[]? | select(.broker_id == $broker_id)][0].configs) // {}' "${snapshot_manifest_path}"
+}
+
+capture_config_dump() {
+  local entity_type="$1"
+  local entity_name="$2"
+  local output_path="$3"
+
+  if recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 \
+    kafka-configs --bootstrap-server kafka-0:9092 --entity-type "${entity_type}" --entity-name "${entity_name}" --describe </dev/null >"${output_path}"; then
+    return 0
+  fi
+
+  recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 \
+    kafka-configs --bootstrap-server kafka-0:9092 --entity-type "${entity_type}" --entity-name "${entity_name}" --describe --all </dev/null >"${output_path}"
+}
+
+normalize_dynamic_config_dump() {
+  local marker="$1"
+  local raw_path="$2"
+  local output_path="$3"
+  local normalized='{}'
+  local line key value synonyms
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" =~ ^[[:space:]]*([^=[:space:]]+)=([^[:space:]]+)[[:space:]]+sensitive=.*synonyms=\{(.*)\}$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      value="${BASH_REMATCH[2]}"
+      synonyms="${BASH_REMATCH[3]}"
+      [[ "${synonyms}" == *"${marker}${key}=${value}"* ]] || continue
+      normalized="$(jq -c --arg key "${key}" --arg value "${value}" '. + {($key): $value}' <<<"${normalized}")"
+    fi
+  done <"${raw_path}"
+
+  jq -S . <<<"${normalized}" >"${output_path}"
+}
+
+capture_recovery_state
+
+a1_details=()
+for topic_name in "${CONFIGURED_TOPICS[@]}"; do
+  if ! manifest_topic_json "${topic_name}" >/dev/null 2>&1; then
+    a1_details+=("${topic_name}:missing-from-manifest")
+    continue
+  fi
+
+  expected_json="$(expected_topic_configs_json "${topic_name}")"
+  [[ "${expected_json}" != "{}" ]] || a1_details+=("${topic_name}:manifest-configs-empty")
+
+  raw_path="${topic_artifact_dir}/${topic_name}.config.txt"
+  normalized_path="${topic_artifact_dir}/${topic_name}.normalized.json"
+
+  if ! capture_config_dump topics "${topic_name}" "${raw_path}"; then
+    a1_details+=("${topic_name}:config-command-failed")
+    continue
+  fi
+
+  normalize_dynamic_config_dump "DYNAMIC_TOPIC_CONFIG:" "${raw_path}" "${normalized_path}"
+  actual_json="$(jq -cS . "${normalized_path}")"
+  [[ "${actual_json}" == "${expected_json}" ]] || a1_details+=("${topic_name}:expected=${expected_json}:actual=${actual_json}")
+done
+
+if [[ "${#a1_details[@]}" -eq 0 ]]; then
+  record_assertion "A1" "Configured topics retain exact dynamic overrides" "PASS" "${topic_artifact_dir}" "all configured topics matched the manifest-backed dynamic topic configs exactly"
+else
+  record_assertion "A1" "Configured topics retain exact dynamic overrides" "FAIL" "${topic_artifact_dir}" "$(printf '%s; ' "${a1_details[@]}" | sed 's/; $//')"
+fi
+
+a2_details=()
+for topic_name in "${ZERO_OVERRIDE_TOPICS[@]}"; do
+  if ! manifest_topic_json "${topic_name}" >/dev/null 2>&1; then
+    a2_details+=("${topic_name}:missing-from-manifest")
+    continue
+  fi
+
+  expected_json="$(expected_topic_configs_json "${topic_name}")"
+  [[ "${expected_json}" == "{}" ]] || a2_details+=("${topic_name}:manifest-configs-not-empty=${expected_json}")
+
+  raw_path="${topic_artifact_dir}/${topic_name}.config.txt"
+  normalized_path="${topic_artifact_dir}/${topic_name}.normalized.json"
+
+  if ! capture_config_dump topics "${topic_name}" "${raw_path}"; then
+    a2_details+=("${topic_name}:config-command-failed")
+    continue
+  fi
+
+  normalize_dynamic_config_dump "DYNAMIC_TOPIC_CONFIG:" "${raw_path}" "${normalized_path}"
+  actual_json="$(jq -cS . "${normalized_path}")"
+  [[ "${actual_json}" == "{}" ]] || a2_details+=("${topic_name}:actual=${actual_json}")
+done
+
+if [[ "${#a2_details[@]}" -eq 0 ]]; then
+  record_assertion "A2" "Zero-override topics remain free of dynamic overrides" "PASS" "${topic_artifact_dir}" "all zero-override topics reported empty dynamic config state"
+else
+  record_assertion "A2" "Zero-override topics remain free of dynamic overrides" "FAIL" "${topic_artifact_dir}" "$(printf '%s; ' "${a2_details[@]}" | sed 's/; $//')"
+fi
+
+a3_details=()
+expected_broker_0_json="$(expected_broker_configs_json 0)"
+[[ "${expected_broker_0_json}" != "{}" ]] || a3_details+=("broker-0:missing-from-manifest")
+broker_0_raw_path="${broker_artifact_dir}/broker-0.config.txt"
+broker_0_normalized_path="${broker_artifact_dir}/broker-0.normalized.json"
+
+if ! capture_config_dump brokers 0 "${broker_0_raw_path}"; then
+  a3_details+=("broker-0:config-command-failed")
+else
+  normalize_dynamic_config_dump "DYNAMIC_BROKER_CONFIG:" "${broker_0_raw_path}" "${broker_0_normalized_path}"
+  broker_0_actual_json="$(jq -cS . "${broker_0_normalized_path}")"
+  [[ "${broker_0_actual_json}" == "${expected_broker_0_json}" ]] || a3_details+=("broker-0:expected=${expected_broker_0_json}:actual=${broker_0_actual_json}")
+fi
+
+if [[ "${#a3_details[@]}" -eq 0 ]]; then
+  record_assertion "A3" "Broker 0 retains the exact dynamic broker override" "PASS" "${broker_artifact_dir}" "broker 0 matched the manifest-backed dynamic broker override exactly"
+else
+  record_assertion "A3" "Broker 0 retains the exact dynamic broker override" "FAIL" "${broker_artifact_dir}" "$(printf '%s; ' "${a3_details[@]}" | sed 's/; $//')"
+fi
+
+a4_details=()
+for broker_id in 1 2; do
+  expected_json="$(expected_broker_configs_json "${broker_id}")"
+  [[ "${expected_json}" == "{}" ]] || a4_details+=("broker-${broker_id}:manifest-configs-not-empty=${expected_json}")
+
+  raw_path="${broker_artifact_dir}/broker-${broker_id}.config.txt"
+  normalized_path="${broker_artifact_dir}/broker-${broker_id}.normalized.json"
+
+  if ! capture_config_dump brokers "${broker_id}" "${raw_path}"; then
+    a4_details+=("broker-${broker_id}:config-command-failed")
+    continue
+  fi
+
+  normalize_dynamic_config_dump "DYNAMIC_BROKER_CONFIG:" "${raw_path}" "${normalized_path}"
+  actual_json="$(jq -cS . "${normalized_path}")"
+  [[ "${actual_json}" == "{}" ]] || a4_details+=("broker-${broker_id}:actual=${actual_json}")
+done
+
+if [[ "${#a4_details[@]}" -eq 0 ]]; then
+  record_assertion "A4" "Brokers 1 and 2 do not gain dynamic broker overrides" "PASS" "${broker_artifact_dir}" "brokers 1 and 2 reported no dynamic broker overrides"
+else
+  record_assertion "A4" "Brokers 1 and 2 do not gain dynamic broker overrides" "FAIL" "${broker_artifact_dir}" "$(printf '%s; ' "${a4_details[@]}" | sed 's/; $//')"
+fi
+
+summary_status="pass"
+if [[ "${had_failure}" -ne 0 ]]; then
+  summary_status="fail"
+fi
+
+jq -s \
+  --arg scenario "${scenario_id}" \
+  --arg run_id "${run_id}" \
+  --arg snapshot_label "${SNAPSHOT_LABEL}" \
+  --arg status "${summary_status}" \
+  --arg generated_at_utc "$(timestamp_utc)" \
+  '{
+    scenario: $scenario,
+    run_id: $run_id,
+    snapshot_label: $snapshot_label,
+    status: $status,
+    generated_at_utc: $generated_at_utc,
+    assertions: .
+  }' "${assertions_jsonl_path}" >"${summary_path}"
+
+log "scenario 05 assert artifacts written to ${assert_dir}"
+
+if [[ "${summary_status}" != "pass" ]]; then
+  exit 1
+fi
