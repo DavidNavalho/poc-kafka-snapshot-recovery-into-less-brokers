@@ -1,0 +1,393 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+require_cmd docker
+require_cmd jq
+require_cmd rg
+
+scenario_id="scenario-08"
+run_id="${1:-}"
+
+[[ -n "${run_id}" ]] || fail "usage: automation/scenarios/scenario-08/assert <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+export RECOVERY_WORKDIR="${WORKDIR}"
+
+assert_dir="${WORKDIR}/artifacts/assert"
+logdir_artifact_dir="${assert_dir}/logdirs"
+meta_artifact_dir="${assert_dir}/meta"
+topic_artifact_dir="${assert_dir}/topics"
+sample_artifact_dir="${assert_dir}/samples"
+recovery_artifact_dir="${WORKDIR}/artifacts/recovery"
+recovery_log_path="${recovery_artifact_dir}/docker-compose.log"
+recovery_ps_path="${assert_dir}/recovery-ps.txt"
+startup_failure_scan_path="${assert_dir}/startup-failure-scan.txt"
+stray_scan_path="${assert_dir}/stray-scan.txt"
+assertions_jsonl_path="${assert_dir}/assertions.jsonl"
+summary_path="${assert_dir}/assert-summary.json"
+snapshot_manifest_path="${WORKDIR}/snapshot-manifest.json"
+source_snapshot_dir="${SNAPSHOT_SOURCE_ROOT}/${SNAPSHOT_LABEL}"
+
+ensure_dir "${assert_dir}"
+ensure_dir "${logdir_artifact_dir}"
+ensure_dir "${meta_artifact_dir}"
+ensure_dir "${topic_artifact_dir}"
+ensure_dir "${sample_artifact_dir}"
+ensure_dir "${recovery_artifact_dir}"
+: >"${assertions_jsonl_path}"
+
+readonly BROKERS=(0 1 2)
+readonly LOGDIR_NAMES=("logdir-0" "logdir-1")
+readonly REPRESENTATIVE_TOPIC="recovery.default.6p"
+readonly REPRESENTATIVE_PARTITIONS=(0 1 2 3 4 5)
+
+had_failure=0
+
+record_assertion() {
+  local id="$1"
+  local name="$2"
+  local result="$3"
+  local evidence="$4"
+  local details="$5"
+
+  if [[ "${result}" != "PASS" ]]; then
+    had_failure=1
+  fi
+
+  jq -nc \
+    --arg id "${id}" \
+    --arg name "${name}" \
+    --arg result "${result}" \
+    --arg evidence "${evidence}" \
+    --arg details "${details}" \
+    '{id: $id, name: $name, result: $result, evidence: $evidence, details: $details}' >>"${assertions_jsonl_path}"
+}
+
+write_scan_output() {
+  local source_path="$1"
+  local pattern="$2"
+  local output_path="$3"
+  local empty_message="$4"
+
+  if [[ ! -f "${source_path}" ]]; then
+    printf 'source file missing: %s\n' "${source_path}" >"${output_path}"
+    return 2
+  fi
+
+  if rg -ni --no-heading --color never "${pattern}" "${source_path}" >"${output_path}"; then
+    return 0
+  fi
+
+  printf '%s\n' "${empty_message}" >"${output_path}"
+  return 1
+}
+
+capture_recovery_state() {
+  recovery_compose "${RECOVERY_PROJECT}" logs --no-color >"${recovery_log_path}" || true
+  recovery_compose "${RECOVERY_PROJECT}" ps >"${recovery_ps_path}" || true
+}
+
+list_user_partition_dirs() {
+  local root_dir="$1"
+  local output_path="$2"
+
+  if [[ ! -d "${root_dir}" ]]; then
+    return 1
+  fi
+
+  {
+    find "${root_dir}" -maxdepth 1 -mindepth 1 -type d | sed 's#^.*/##' | grep '^recovery\.' | sort || true
+  } >"${output_path}"
+}
+
+normalize_properties_file() {
+  local input_path="$1"
+  local output_path="$2"
+
+  if [[ ! -f "${input_path}" ]]; then
+    return 1
+  fi
+
+  awk '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    { print }
+  ' "${input_path}" | sort >"${output_path}"
+}
+
+properties_value() {
+  local normalized_path="$1"
+  local key="$2"
+
+  awk -F= -v key="${key}" '$1 == key { print substr($0, index($0, "=") + 1) }' "${normalized_path}"
+}
+
+representative_topic_json() {
+  jq -cer --arg topic "${REPRESENTATIVE_TOPIC}" '.topics[] | select(.name == $topic)' "${snapshot_manifest_path}"
+}
+
+expected_partition_count() {
+  representative_topic_json | jq -r '.partitions'
+}
+
+expected_latest_offset() {
+  local partition_id="$1"
+  representative_topic_json | jq -r --arg partition "${partition_id}" '.expected_latest_offsets[$partition] // empty'
+}
+
+consume_partition_count() {
+  local topic_name="$1"
+  local partition_id="$2"
+  recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 bash -lc "
+    kafka-console-consumer \
+      --bootstrap-server kafka-0:9092 \
+      --topic '${topic_name}' \
+      --partition ${partition_id} \
+      --from-beginning \
+      --timeout-ms 20000 2>/dev/null | wc -l
+  " </dev/null | tr -d '[:space:]'
+}
+
+consume_partition_preview() {
+  local topic_name="$1"
+  local partition_id="$2"
+  recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 bash -lc "
+    kafka-console-consumer \
+      --bootstrap-server kafka-0:9092 \
+      --topic '${topic_name}' \
+      --partition ${partition_id} \
+      --from-beginning \
+      --max-messages 5 \
+      --timeout-ms 20000 2>/dev/null
+  " </dev/null
+}
+
+capture_recovery_state
+
+a1_details=()
+for broker_id in "${BROKERS[@]}"; do
+  for logdir_name in "${LOGDIR_NAMES[@]}"; do
+    source_dir="${source_snapshot_dir}/brokers/broker-${broker_id}/${logdir_name}"
+    recovered_dir="${WORKDIR}/brokers/broker-${broker_id}/${logdir_name}"
+    source_listing_path="${logdir_artifact_dir}/broker-${broker_id}.${logdir_name}.source-partitions.txt"
+    recovered_listing_path="${logdir_artifact_dir}/broker-${broker_id}.${logdir_name}.recovered-partitions.txt"
+
+    if ! list_user_partition_dirs "${source_dir}" "${source_listing_path}"; then
+      a1_details+=("broker-${broker_id}:${logdir_name}:source-dir-missing")
+      continue
+    fi
+    if ! list_user_partition_dirs "${recovered_dir}" "${recovered_listing_path}"; then
+      a1_details+=("broker-${broker_id}:${logdir_name}:recovered-dir-missing")
+      continue
+    fi
+
+    if [[ ! -s "${recovered_listing_path}" ]]; then
+      a1_details+=("broker-${broker_id}:${logdir_name}:recovered-empty")
+    fi
+
+    if ! cmp -s "${source_listing_path}" "${recovered_listing_path}"; then
+      source_listing="$(tr '\n' ',' <"${source_listing_path}" | sed 's/,$//')"
+      recovered_listing="$(tr '\n' ',' <"${recovered_listing_path}" | sed 's/,$//')"
+      a1_details+=("broker-${broker_id}:${logdir_name}:source=${source_listing}:recovered=${recovered_listing}")
+    fi
+  done
+done
+
+if [[ "${#a1_details[@]}" -eq 0 ]]; then
+  record_assertion "A1" "Recovered user partition directories match the source snapshot across both log dirs" "PASS" "${logdir_artifact_dir}" "recovered user partition directory sets matched the source snapshot for both log dirs on brokers 0,1,2"
+else
+  record_assertion "A1" "Recovered user partition directories match the source snapshot across both log dirs" "FAIL" "${logdir_artifact_dir}" "$(printf '%s; ' "${a1_details[@]}" | sed 's/; $//')"
+fi
+
+a2_details=()
+expected_cluster_id="$(jq -r '.cluster.cluster_id // empty' "${snapshot_manifest_path}")"
+for broker_id in "${BROKERS[@]}"; do
+  normalized_logdir_0=""
+  normalized_logdir_1=""
+  for dir_name in logdir-0 logdir-1 metadata; do
+    source_meta_path="${source_snapshot_dir}/brokers/broker-${broker_id}/${dir_name}/meta.properties"
+    recovered_meta_path="${WORKDIR}/brokers/broker-${broker_id}/${dir_name}/meta.properties"
+    source_copy_path="${meta_artifact_dir}/broker-${broker_id}.${dir_name}.source.meta.properties"
+    recovered_copy_path="${meta_artifact_dir}/broker-${broker_id}.${dir_name}.recovered.meta.properties"
+    source_normalized_path="${meta_artifact_dir}/broker-${broker_id}.${dir_name}.source.normalized.properties"
+    recovered_normalized_path="${meta_artifact_dir}/broker-${broker_id}.${dir_name}.recovered.normalized.properties"
+
+    if [[ ! -f "${source_meta_path}" ]]; then
+      a2_details+=("broker-${broker_id}:${dir_name}:source-meta-missing")
+      continue
+    fi
+    if [[ ! -f "${recovered_meta_path}" ]]; then
+      a2_details+=("broker-${broker_id}:${dir_name}:recovered-meta-missing")
+      continue
+    fi
+
+    cp "${source_meta_path}" "${source_copy_path}"
+    cp "${recovered_meta_path}" "${recovered_copy_path}"
+    normalize_properties_file "${source_meta_path}" "${source_normalized_path}" || a2_details+=("broker-${broker_id}:${dir_name}:source-normalize-failed")
+    normalize_properties_file "${recovered_meta_path}" "${recovered_normalized_path}" || a2_details+=("broker-${broker_id}:${dir_name}:recovered-normalize-failed")
+
+    if [[ -f "${source_normalized_path}" && -f "${recovered_normalized_path}" ]] && ! cmp -s "${source_normalized_path}" "${recovered_normalized_path}"; then
+      a2_details+=("broker-${broker_id}:${dir_name}:meta-mismatch")
+    fi
+
+    if [[ "${dir_name}" == "logdir-0" ]]; then
+      normalized_logdir_0="${recovered_normalized_path}"
+    elif [[ "${dir_name}" == "logdir-1" ]]; then
+      normalized_logdir_1="${recovered_normalized_path}"
+    fi
+  done
+
+  if [[ -n "${normalized_logdir_0}" && -f "${normalized_logdir_0}" ]]; then
+    cluster_id_0="$(properties_value "${normalized_logdir_0}" "cluster.id")"
+    node_id_0="$(properties_value "${normalized_logdir_0}" "node.id")"
+    directory_id_0="$(properties_value "${normalized_logdir_0}" "directory.id")"
+    [[ "${cluster_id_0}" == "${expected_cluster_id}" ]] || a2_details+=("broker-${broker_id}:logdir-0:cluster.id=${cluster_id_0}")
+    [[ "${node_id_0}" == "${broker_id}" ]] || a2_details+=("broker-${broker_id}:logdir-0:node.id=${node_id_0}")
+    [[ -n "${directory_id_0}" ]] || a2_details+=("broker-${broker_id}:logdir-0:directory.id-missing")
+  else
+    directory_id_0=""
+  fi
+
+  if [[ -n "${normalized_logdir_1}" && -f "${normalized_logdir_1}" ]]; then
+    cluster_id_1="$(properties_value "${normalized_logdir_1}" "cluster.id")"
+    node_id_1="$(properties_value "${normalized_logdir_1}" "node.id")"
+    directory_id_1="$(properties_value "${normalized_logdir_1}" "directory.id")"
+    [[ "${cluster_id_1}" == "${expected_cluster_id}" ]] || a2_details+=("broker-${broker_id}:logdir-1:cluster.id=${cluster_id_1}")
+    [[ "${node_id_1}" == "${broker_id}" ]] || a2_details+=("broker-${broker_id}:logdir-1:node.id=${node_id_1}")
+    [[ -n "${directory_id_1}" ]] || a2_details+=("broker-${broker_id}:logdir-1:directory.id-missing")
+  else
+    directory_id_1=""
+  fi
+
+  if [[ -n "${directory_id_0}" && -n "${directory_id_1}" && "${directory_id_0}" == "${directory_id_1}" ]]; then
+    a2_details+=("broker-${broker_id}:duplicate-directory.id=${directory_id_0}")
+  fi
+done
+
+if [[ "${#a2_details[@]}" -eq 0 ]]; then
+  record_assertion "A2" "Meta.properties identity remains consistent across both recovered log dirs" "PASS" "${meta_artifact_dir}" "recovered meta.properties files matched the source snapshot and retained consistent cluster, node, and directory identity"
+else
+  record_assertion "A2" "Meta.properties identity remains consistent across both recovered log dirs" "FAIL" "${meta_artifact_dir}" "$(printf '%s; ' "${a2_details[@]}" | sed 's/; $//')"
+fi
+
+find "${WORKDIR}/brokers" -type d -name '*-stray' | sort >"${stray_scan_path}.tmp" || true
+if [[ -s "${stray_scan_path}.tmp" ]]; then
+  mv "${stray_scan_path}.tmp" "${stray_scan_path}"
+  stray_scan_status=0
+else
+  printf 'no stray directories detected\n' >"${stray_scan_path}"
+  rm -f "${stray_scan_path}.tmp"
+  stray_scan_status=1
+fi
+
+failure_pattern='stray|-stray|meta\.properties.*(mismatch|inconsistent|error|exception)|directory\.id.*(mismatch|inconsistent|error|exception)'
+
+set +e
+write_scan_output "${recovery_log_path}" "${failure_pattern}" "${startup_failure_scan_path}" "no startup failure patterns detected"
+failure_scan_status=$?
+set -e
+
+if [[ "${stray_scan_status}" -eq 0 ]]; then
+  a3_details=("stray directories detected in recovered log dirs")
+elif [[ "${failure_scan_status}" -eq 0 ]]; then
+  a3_details=("startup failure patterns detected in recovery logs")
+elif [[ "${failure_scan_status}" -eq 2 ]]; then
+  a3_details=("recovery log file missing")
+else
+  a3_details=()
+fi
+
+if [[ "${#a3_details[@]}" -eq 0 ]]; then
+  record_assertion "A3" "Happy-path recovery produces no stray directories or multi-disk identity failures" "PASS" "${startup_failure_scan_path}" "no stray directories or explicit multi-disk identity failure patterns were detected"
+else
+  record_assertion "A3" "Happy-path recovery produces no stray directories or multi-disk identity failures" "FAIL" "${startup_failure_scan_path}" "$(printf '%s; ' "${a3_details[@]}" | sed 's/; $//')"
+fi
+
+a4_details=()
+describe_path="${topic_artifact_dir}/${REPRESENTATIVE_TOPIC}.describe.txt"
+unavailable_path="${topic_artifact_dir}/${REPRESENTATIVE_TOPIC}.unavailable.txt"
+
+if ! representative_topic_json >/dev/null 2>&1; then
+  a4_details+=("${REPRESENTATIVE_TOPIC}:missing-from-manifest")
+else
+  if ! recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 \
+    kafka-topics --bootstrap-server kafka-0:9092 --describe --topic "${REPRESENTATIVE_TOPIC}" </dev/null >"${describe_path}"; then
+    a4_details+=("${REPRESENTATIVE_TOPIC}:describe-command-failed")
+  fi
+
+  if ! recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 \
+    kafka-topics --bootstrap-server kafka-0:9092 --describe --topic "${REPRESENTATIVE_TOPIC}" --unavailable-partitions </dev/null >"${unavailable_path}"; then
+    a4_details+=("${REPRESENTATIVE_TOPIC}:unavailable-command-failed")
+  fi
+
+  if [[ -f "${describe_path}" ]]; then
+    grep -q "Topic: ${REPRESENTATIVE_TOPIC}" "${describe_path}" || a4_details+=("${REPRESENTATIVE_TOPIC}:missing-topic")
+    actual_partition_count="$(grep -c 'Partition:' "${describe_path}" || true)"
+    expected_partition_total="$(expected_partition_count)"
+    [[ "${actual_partition_count}" == "${expected_partition_total}" ]] || a4_details+=("${REPRESENTATIVE_TOPIC}:partition-count=${actual_partition_count}")
+  fi
+
+  if [[ -f "${unavailable_path}" ]] && [[ -n "$(tr -d '[:space:]' <"${unavailable_path}")" ]]; then
+    a4_details+=("${REPRESENTATIVE_TOPIC}:has-unavailable-partitions")
+  fi
+
+  for partition_id in "${REPRESENTATIVE_PARTITIONS[@]}"; do
+    count_path="${sample_artifact_dir}/${REPRESENTATIVE_TOPIC}.p${partition_id}.count.txt"
+    preview_path="${sample_artifact_dir}/${REPRESENTATIVE_TOPIC}.p${partition_id}.preview.txt"
+    expected_offset="$(expected_latest_offset "${partition_id}")"
+    if [[ -z "${expected_offset}" ]]; then
+      a4_details+=("${REPRESENTATIVE_TOPIC}:missing-expected-offset-p${partition_id}")
+      continue
+    fi
+
+    if actual_count="$(consume_partition_count "${REPRESENTATIVE_TOPIC}" "${partition_id}")"; then
+      printf '%s\n' "${actual_count}" >"${count_path}"
+    else
+      a4_details+=("${REPRESENTATIVE_TOPIC}:p${partition_id}:count-command-failed")
+      continue
+    fi
+
+    if ! consume_partition_preview "${REPRESENTATIVE_TOPIC}" "${partition_id}" >"${preview_path}"; then
+      a4_details+=("${REPRESENTATIVE_TOPIC}:p${partition_id}:preview-command-failed")
+      continue
+    fi
+
+    [[ "${actual_count}" == "${expected_offset}" ]] || a4_details+=("p${partition_id}=${actual_count}")
+  done
+fi
+
+if [[ "${#a4_details[@]}" -eq 0 ]]; then
+  record_assertion "A4" "Representative multi-disk partitions remain readable from the beginning" "PASS" "${sample_artifact_dir}" "recovery.default.6p remained fully available and partitions 0..5 consumed to the manifest-backed offsets"
+else
+  record_assertion "A4" "Representative multi-disk partitions remain readable from the beginning" "FAIL" "${sample_artifact_dir}" "$(printf '%s; ' "${a4_details[@]}" | sed 's/; $//')"
+fi
+
+summary_status="pass"
+if [[ "${had_failure}" -ne 0 ]]; then
+  summary_status="fail"
+fi
+
+jq -s \
+  --arg scenario "${scenario_id}" \
+  --arg run_id "${run_id}" \
+  --arg snapshot_label "${SNAPSHOT_LABEL}" \
+  --arg status "${summary_status}" \
+  --arg generated_at_utc "$(timestamp_utc)" \
+  '{
+    scenario: $scenario,
+    run_id: $run_id,
+    snapshot_label: $snapshot_label,
+    status: $status,
+    generated_at_utc: $generated_at_utc,
+    assertions: .
+  }' "${assertions_jsonl_path}" >"${summary_path}"
+
+log "scenario 08 assert artifacts written to ${assert_dir}"
+
+if [[ "${summary_status}" != "pass" ]]; then
+  exit 1
+fi

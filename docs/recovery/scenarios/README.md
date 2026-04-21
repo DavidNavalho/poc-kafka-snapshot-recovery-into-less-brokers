@@ -20,7 +20,7 @@ Short, human-readable summaries live under
 | 05 | [scenario-05-config-preservation.md](./scenario-05-config-preservation.md) | Prove topic and broker dynamic configs survive the rewrite | 1 | Implemented |
 | 06 | [scenario-06-compacted-topic-recovery.md](./scenario-06-compacted-topic-recovery.md) | Prove compacted topics retain latest-per-key data | 1 | Planned |
 | 07 | [scenario-07-transaction-state-recovery.md](./scenario-07-transaction-state-recovery.md) | Prove transaction state survives and new transactional producers work | 1 | Planned |
-| 08 | [scenario-08-multiple-log-directories.md](./scenario-08-multiple-log-directories.md) | Prove the recovery works with two log directories per broker | 1 | Planned |
+| 08 | [scenario-08-multiple-log-directories.md](./scenario-08-multiple-log-directories.md) | Prove the recovery works with two log directories per broker | 1 | Implemented |
 | 09 | [scenario-09-live-snapshot-extension.md](./scenario-09-live-snapshot-extension.md) | Extend the harness to crash-consistent live-copy behavior | 2 | Deferred |
 | 10 | [scenario-10-rf1-steady-state-and-expansion.md](./scenario-10-rf1-steady-state-and-expansion.md) | Prove the recovered cluster stabilizes at RF=1 and can later expand | 1 | Planned |
 | 11 | [scenario-11-end-to-end-automation.md](./scenario-11-end-to-end-automation.md) | Run the whole clean-stop flow as one scripted path | 1 | Planned |
@@ -40,3 +40,4 @@ Short, human-readable summaries live under
 - [Scenario 01 Report Card](./report-cards/scenario-01-report-card.md)
 - [Scenario 02 Report Card](./report-cards/scenario-02-report-card.md)
 - [Scenario 05 Report Card](./report-cards/scenario-05-report-card.md)
+- [Scenario 08 Report Card](./report-cards/scenario-08-report-card.md)

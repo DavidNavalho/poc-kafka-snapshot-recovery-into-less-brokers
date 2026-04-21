@@ -18,6 +18,7 @@ This file is the current planning authority for:
 - Scenario 01 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh copied snapshot workdir.
 - Scenario 02 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T095313Z`.
 - Scenario 05 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T113800Z`.
+- Scenario 08 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T131900Z`.
 - Two important runtime issues were already found and fixed:
   - source and recovery clusters must not share the same Docker network namespace
   - copied metadata snapshot directories must be cleaned more aggressively before installing rewritten state
@@ -203,8 +204,9 @@ Done gate:
 
 Current status:
 
-- partially covered by the base harness because the canonical layout already uses two `log.dirs`
-- explicit assertions are still missing
+- implemented and validated from a fresh worktree
+- latest clean report: `docs/recovery/reports/runs/2026-04-21-scenario-08-20260421T131900Z.md`
+- multi-disk directory-set comparison, `meta.properties` identity checks, stray scanning, and representative read probes are now automated
 
 Spec before implementation:
 
@@ -219,9 +221,13 @@ Likely implementation focus:
 - `meta.properties` comparison across recovered disk roots
 - representative topic availability checks across both directories
 
-Done gate:
+Success contract:
 
 - both recovered `log.dirs` contain valid partition state, `meta.properties` is consistent, and representative data remains readable
+
+Done gate:
+
+- achieved on 2026-04-21 by run `20260421T131900Z`
 
 ### Scenario 04: Consumer Offset Continuity
 
