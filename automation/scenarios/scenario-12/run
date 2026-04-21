@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+require_cmd python3
+require_cmd jq
+
+scenario_id="scenario-12"
+snapshot_label="${1:-baseline-clean-v3}"
+run_id="${2:-$(run_id_utc)}"
+suite_runner="${SCENARIO12_SUITE_RUNNER:-${REPO_ROOT}/automation/scenarios/scenario-11/run}"
+
+workdir="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}"
+normalized_dir="${workdir}/artifacts/normalized"
+steps_dir="${workdir}/artifacts/steps"
+manifest_path="${workdir}/artifacts/repeatability-manifest.json"
+assert_dir="${workdir}/artifacts/assert"
+report_date="$(date -u +%F)"
+
+[[ ! -e "${workdir}" ]] || fail "scenario run already exists: ${workdir}"
+
+ensure_dir "${normalized_dir}"
+ensure_dir "${steps_dir}"
+ensure_dir "${assert_dir}"
+
+cat >"${workdir}/run.env" <<EOF
+SCENARIO_ID=${scenario_id}
+RUN_ID=${run_id}
+SNAPSHOT_LABEL=${snapshot_label}
+WORKDIR=${workdir}
+REPEATABILITY_MANIFEST_PATH=${manifest_path}
+EOF
+
+run_suite() {
+  local suite_run_id="$1"
+  local log_path="$2"
+  if env REPO_ROOT="${REPO_ROOT}" SNAPSHOTS_ROOT="${SNAPSHOTS_ROOT}" "${suite_runner}" "${snapshot_label}" "${suite_run_id}" >"${log_path}" 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+build_bundle() {
+  local suite_manifest_path="$1"
+  local output_path="$2"
+  python3 "${REPO_ROOT}/automation/lib/build_repeatability_bundle.py" \
+    --suite-manifest "${suite_manifest_path}" \
+    --output "${output_path}"
+}
+
+suite_run_1_id="${run_id}-run1"
+suite_run_2_id="${run_id}-run2"
+suite_run_1_log="${steps_dir}/01-run1-suite.log"
+suite_run_2_log="${steps_dir}/03-run2-suite.log"
+bundle_run_1_log="${steps_dir}/02-run1-bundle.log"
+bundle_run_2_log="${steps_dir}/04-run2-bundle.log"
+suite_manifest_1="${SCENARIO_RUNS_ROOT}/scenario-11/${suite_run_1_id}/artifacts/suite-manifest.json"
+suite_manifest_2="${SCENARIO_RUNS_ROOT}/scenario-11/${suite_run_2_id}/artifacts/suite-manifest.json"
+suite_report_1="${REPORT_RUNS_ROOT}/${report_date}-scenario-11-${suite_run_1_id}.md"
+suite_report_2="${REPORT_RUNS_ROOT}/${report_date}-scenario-11-${suite_run_2_id}.md"
+bundle_1_path="${normalized_dir}/run1.bundle.json"
+bundle_2_path="${normalized_dir}/run2.bundle.json"
+
+suite_status_1="fail"
+bundle_status_1="missing"
+suite_status_2="skipped"
+bundle_status_2="skipped"
+
+if run_suite "${suite_run_1_id}" "${suite_run_1_log}"; then
+  suite_status_1="pass"
+fi
+if [[ -f "${suite_manifest_1}" ]] && build_bundle "${suite_manifest_1}" "${bundle_1_path}" >"${bundle_run_1_log}" 2>&1; then
+  bundle_status_1="ready"
+fi
+
+if [[ "${suite_status_1}" == "pass" && "${bundle_status_1}" == "ready" ]]; then
+  suite_status_2="fail"
+  bundle_status_2="missing"
+
+  if run_suite "${suite_run_2_id}" "${suite_run_2_log}"; then
+    suite_status_2="pass"
+  fi
+  if [[ -f "${suite_manifest_2}" ]] && build_bundle "${suite_manifest_2}" "${bundle_2_path}" >"${bundle_run_2_log}" 2>&1; then
+    bundle_status_2="ready"
+  fi
+else
+  printf 'skipped run2 because run1 suite_status=%s and bundle_status=%s\n' "${suite_status_1}" "${bundle_status_1}" >"${suite_run_2_log}"
+  printf 'skipped bundle generation because run2 was not executed\n' >"${bundle_run_2_log}"
+fi
+
+cat >"${manifest_path}" <<EOF
+{
+  "scenario": "${scenario_id}",
+  "run_id": "${run_id}",
+  "snapshot_label": "${snapshot_label}",
+  "run1": {
+    "suite_run_id": "${suite_run_1_id}",
+    "status": "${suite_status_1}",
+    "suite_manifest_path": "${suite_manifest_1}",
+    "suite_report_path": "${suite_report_1}",
+    "bundle_path": "${bundle_1_path}",
+    "bundle_status": "${bundle_status_1}",
+    "step_log_path": "${suite_run_1_log}"
+  },
+  "run2": {
+    "suite_run_id": "${suite_run_2_id}",
+    "status": "${suite_status_2}",
+    "suite_manifest_path": "${suite_manifest_2}",
+    "suite_report_path": "${suite_report_2}",
+    "bundle_path": "${bundle_2_path}",
+    "bundle_status": "${bundle_status_2}",
+    "step_log_path": "${suite_run_2_log}"
+  }
+}
+EOF
+
+"${REPO_ROOT}/automation/scenarios/scenario-12/assert" "${run_id}"
+"${REPO_ROOT}/automation/scenarios/scenario-12/report" "${run_id}"
+
+summary_status="$(jq -r '.status // "fail"' "${assert_dir}/assert-summary.json")"
+if [[ "${summary_status}" != "pass" ]]; then
+  fail "Scenario 12 repeatability check failed; see ${manifest_path}"
+fi
+
+log "scenario 12 repeatability run completed successfully"

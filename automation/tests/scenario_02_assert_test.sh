@@ -231,6 +231,7 @@ EOF
 
   cat >"${fixture_root}/logs.txt" <<'EOF'
 [2026-04-21T09:00:00Z] INFO recovery cluster ready
+[2026-04-21T09:00:01Z] INFO Incarnation oCrCR1vuR0SoSNKpeIIPlA registered for broker 1
 EOF
 
   cat >"${fixture_root}/ps.txt" <<'EOF'

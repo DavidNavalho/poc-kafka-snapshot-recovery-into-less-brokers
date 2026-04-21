@@ -84,11 +84,13 @@ for scenario_name in "${core_scenarios[@]}"; do
   scenario_workdir="${SCENARIO_RUNS_ROOT}/${scenario_name}/${scenario_run_id}"
   scenario_status="pass"
   steps_json='[]'
-  recovery_started=0
+  cleanup_required=0
 
   if ! log_step "${scenario_name}" 1 prepare env REPO_ROOT="${REPO_ROOT}" SNAPSHOTS_ROOT="${SNAPSHOTS_ROOT}" "${scenario_automation_root}/recovery/prepare" "${scenario_name}" "${snapshot_label}" "${scenario_run_id}"; then
     scenario_status="fail"
     overall_status="fail"
+  else
+    cleanup_required=1
   fi
   steps_json="$(append_step_json "${steps_json}" "prepare" "${SCENARIO11_LAST_STATUS}" "${SCENARIO11_LAST_LOG_PATH}")"
 
@@ -104,8 +106,6 @@ for scenario_name in "${core_scenarios[@]}"; do
     if ! log_step "${scenario_name}" 3 up env REPO_ROOT="${REPO_ROOT}" SNAPSHOTS_ROOT="${SNAPSHOTS_ROOT}" "${scenario_automation_root}/recovery/up" "${scenario_name}" "${scenario_run_id}"; then
       scenario_status="fail"
       overall_status="fail"
-    else
-      recovery_started=1
     fi
     steps_json="$(append_step_json "${steps_json}" "up" "${SCENARIO11_LAST_STATUS}" "${SCENARIO11_LAST_LOG_PATH}")"
   fi
@@ -126,7 +126,7 @@ for scenario_name in "${core_scenarios[@]}"; do
     steps_json="$(append_step_json "${steps_json}" "report" "${SCENARIO11_LAST_STATUS}" "${SCENARIO11_LAST_LOG_PATH}")"
   fi
 
-  if [[ "${recovery_started}" -eq 1 ]]; then
+  if [[ "${cleanup_required}" -eq 1 ]]; then
     if ! log_step "${scenario_name}" 6 down env REPO_ROOT="${REPO_ROOT}" SNAPSHOTS_ROOT="${SNAPSHOTS_ROOT}" "${scenario_automation_root}/recovery/down" "${scenario_name}" "${scenario_run_id}"; then
       scenario_status="fail"
       overall_status="fail"

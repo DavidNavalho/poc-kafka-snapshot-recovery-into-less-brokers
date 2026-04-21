@@ -24,9 +24,10 @@ The repo is no longer spec-only. The current state is:
 - Scenario 03 is fully automated and passed cleanly on 2026-04-21 with run ID `20260421T154928Z`
 - Scenario 10 is fully automated and passed cleanly on 2026-04-21 with run ID `20260421T162030Z`
 - Scenario 11 is fully automated and passed cleanly on 2026-04-21 with run ID `20260421T163100Z`
+- Scenario 12 is fully automated and passed cleanly on 2026-04-21 with run ID `20260421T170720Z`
 - the harness now supports worktree-friendly root overrides so scenario work can run from a dedicated Git worktree while still pointing at shared snapshot artifacts
 
-Use [`scenario-implementation-roadmap.md`](./scenario-implementation-roadmap.md) as the authoritative execution plan. Scenario 01, Scenario 02, Scenario 03, Scenario 04, Scenario 05, Scenario 06, Scenario 07, Scenario 08, Scenario 10, and Scenario 11 are now the completed anchors; Scenario 12 is the next implementation target.
+Use [`scenario-implementation-roadmap.md`](./scenario-implementation-roadmap.md) as the authoritative execution plan. Scenario 01, Scenario 02, Scenario 03, Scenario 04, Scenario 05, Scenario 06, Scenario 07, Scenario 08, Scenario 10, Scenario 11, and Scenario 12 are now the completed clean-stop anchors. Scenario 09 remains the only deferred extension.
 
 ## Implemented Files
 
@@ -53,6 +54,7 @@ Use [`scenario-implementation-roadmap.md`](./scenario-implementation-roadmap.md)
 - `automation/lib/probe_transaction_state.py`
 - `automation/lib/generate_reassignment_payload.py`
 - `automation/lib/normalize_topic_describe.py`
+- `automation/lib/build_repeatability_bundle.py`
 
 ### Source Cluster Commands
 
@@ -74,6 +76,9 @@ Use [`scenario-implementation-roadmap.md`](./scenario-implementation-roadmap.md)
 - `automation/scenarios/scenario-11/run`
 - `automation/scenarios/scenario-11/assert`
 - `automation/scenarios/scenario-11/report`
+- `automation/scenarios/scenario-12/run`
+- `automation/scenarios/scenario-12/assert`
+- `automation/scenarios/scenario-12/report`
 
 ### Targeted Recovery Tests
 
@@ -99,8 +104,12 @@ Use [`scenario-implementation-roadmap.md`](./scenario-implementation-roadmap.md)
 - `automation/tests/scenario_10_assert_test.sh`
 - `automation/tests/scenario_10_report_test.sh`
 - `automation/tests/scenario_11_run_test.sh`
+- `automation/tests/scenario_11_cleanup_test.sh`
 - `automation/tests/scenario_11_assert_test.sh`
 - `automation/tests/scenario_11_report_test.sh`
+- `automation/tests/scenario_12_run_test.sh`
+- `automation/tests/scenario_12_assert_test.sh`
+- `automation/tests/scenario_12_report_test.sh`
 - `automation/tests/compose_network_isolation_test.sh`
 - `automation/tests/source_fixture_compacted_contract_test.sh`
 
@@ -224,10 +233,17 @@ These checks were completed successfully:
   - `automation/recovery/down scenario-10 20260421T162030Z`
 - targeted Scenario 11 shell tests:
   - `bash automation/tests/scenario_11_run_test.sh`
+  - `bash automation/tests/scenario_11_cleanup_test.sh`
   - `bash automation/tests/scenario_11_assert_test.sh`
   - `bash automation/tests/scenario_11_report_test.sh`
 - real Scenario 11 suite run after:
   - `SNAPSHOTS_ROOT=/private/tmp/poc-kafka-snapshot-recovery-scenario-06/fixtures/snapshots automation/scenarios/scenario-11/run baseline-clean-v3 20260421T163100Z`
+- targeted Scenario 12 shell tests:
+  - `bash automation/tests/scenario_12_run_test.sh`
+  - `bash automation/tests/scenario_12_assert_test.sh`
+  - `bash automation/tests/scenario_12_report_test.sh`
+- real Scenario 12 repeatability run after:
+  - `SNAPSHOTS_ROOT=/private/tmp/poc-kafka-snapshot-recovery-scenario-06/fixtures/snapshots automation/scenarios/scenario-12/run baseline-clean-v3 20260421T170720Z`
 
 Important runtime detail:
 
@@ -237,8 +253,8 @@ Important runtime detail:
 
 ## Known Gaps
 
-- Scenario 12 is still planned work
-- Scenario 09 remains intentionally deferred until the clean-stop suite is green
+- the clean-stop scenario suite is now implemented through Scenario 12
+- Scenario 09 remains intentionally deferred beyond the now-green clean-stop suite
 
 ## Important Fixes Already Landed
 
@@ -258,6 +274,9 @@ Important runtime detail:
 - Scenario 03 rollback now accounts for Kafka's tokenized `<topic>-<partition>.<token>-stray` rename pattern rather than assuming a plain `-stray` suffix
 - Scenario 10 now ships a deterministic reassignment payload generator and topic-describe normalizer so replica expansion checks compare logical partition state instead of raw text
 - Scenario 11 now ships a suite-manifest contract and per-step log bundle so the full clean-stop validation path can be executed and resumed as one automation surface
+- Scenario 02 log-corruption scanning now avoids false positives from broker incarnation IDs that happen to contain the substring `crc`
+- Scenario 11 now always runs `down` after a prepared scenario, even when `up` only partially succeeds, so failed suite steps do not leak fixed host ports into later reruns
+- Scenario 12 now skips the second suite pass when the first pass already failed or could not produce its normalized bundle, avoiding wasteful overlapping recovery clusters during repeatability failures
 
 These fixes matter because an earlier shared-network setup allowed recovery brokers to resolve source-cluster hostnames and join the wrong Raft peer, which looked like mysterious epoch jumps rather than an obvious wiring failure.
 

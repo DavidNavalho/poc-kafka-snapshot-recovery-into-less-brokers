@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+require_cmd jq
+require_cmd diff
+
+scenario_id="scenario-12"
+run_id="${1:-}"
+
+[[ -n "${run_id}" ]] || fail "usage: automation/scenarios/scenario-12/assert <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+
+manifest_path="${REPEATABILITY_MANIFEST_PATH:-${WORKDIR}/artifacts/repeatability-manifest.json}"
+assert_dir="${WORKDIR}/artifacts/assert"
+normalized_dir="${WORKDIR}/artifacts/normalized"
+summary_path="${assert_dir}/assert-summary.json"
+assertions_jsonl_path="${assert_dir}/assertions.jsonl"
+diff_path="${normalized_dir}/diff.txt"
+
+ensure_dir "${assert_dir}"
+ensure_dir "${normalized_dir}"
+: >"${assertions_jsonl_path}"
+: >"${diff_path}"
+
+had_failure=0
+
+record_assertion() {
+  local id="$1"
+  local name="$2"
+  local result="$3"
+  local evidence="$4"
+  local details="$5"
+
+  if [[ "${result}" != "PASS" ]]; then
+    had_failure=1
+  fi
+
+  jq -nc \
+    --arg id "${id}" \
+    --arg name "${name}" \
+    --arg result "${result}" \
+    --arg evidence "${evidence}" \
+    --arg details "${details}" \
+    '{id: $id, name: $name, result: $result, evidence: $evidence, details: $details}' >>"${assertions_jsonl_path}"
+}
+
+run1_status="$(jq -r '.run1.status // "missing"' "${manifest_path}")"
+run2_status="$(jq -r '.run2.status // "missing"' "${manifest_path}")"
+bundle1_path="$(jq -r '.run1.bundle_path // empty' "${manifest_path}")"
+bundle2_path="$(jq -r '.run2.bundle_path // empty' "${manifest_path}")"
+
+if [[ "${run1_status}" == "pass" && -f "$(jq -r '.run1.suite_manifest_path' "${manifest_path}")" ]]; then
+  record_assertion "A1" "The first suite rerun completed successfully" "PASS" "${manifest_path}" "run1 completed with suite status pass and a readable suite manifest"
+else
+  record_assertion "A1" "The first suite rerun completed successfully" "FAIL" "${manifest_path}" "run1-status=${run1_status}"
+fi
+
+if [[ "${run2_status}" == "pass" && -f "$(jq -r '.run2.suite_manifest_path' "${manifest_path}")" ]]; then
+  record_assertion "A2" "The second suite rerun completed successfully" "PASS" "${manifest_path}" "run2 completed with suite status pass and a readable suite manifest"
+else
+  record_assertion "A2" "The second suite rerun completed successfully" "FAIL" "${manifest_path}" "run2-status=${run2_status}"
+fi
+
+a3_details=()
+if [[ ! -f "${bundle1_path}" ]]; then
+  a3_details+=("run1-bundle-missing")
+fi
+if [[ ! -f "${bundle2_path}" ]]; then
+  a3_details+=("run2-bundle-missing")
+fi
+if [[ -f "${bundle1_path}" && -f "${bundle2_path}" ]]; then
+  run1_scenarios="$(jq -r '.scenarios | keys | join(",")' "${bundle1_path}")"
+  run2_scenarios="$(jq -r '.scenarios | keys | join(",")' "${bundle2_path}")"
+  [[ "${run1_scenarios}" == "${run2_scenarios}" ]] || a3_details+=("run1=${run1_scenarios}:run2=${run2_scenarios}")
+fi
+
+if [[ "${#a3_details[@]}" -eq 0 ]]; then
+  record_assertion "A3" "Both normalized bundles were generated from the expected stable artifact surface" "PASS" "${normalized_dir}" "both normalized bundles exist and cover the same scenario IDs"
+else
+  record_assertion "A3" "Both normalized bundles were generated from the expected stable artifact surface" "FAIL" "${normalized_dir}" "$(printf '%s; ' "${a3_details[@]}" | sed 's/; $//')"
+fi
+
+if [[ -f "${bundle1_path}" && -f "${bundle2_path}" ]] && cmp -s "${bundle1_path}" "${bundle2_path}"; then
+  record_assertion "A4" "The normalized bundles match exactly" "PASS" "${diff_path}" "the normalized repeatability bundles were byte-identical"
+else
+  if [[ -f "${bundle1_path}" && -f "${bundle2_path}" ]]; then
+    diff -u "${bundle1_path}" "${bundle2_path}" >"${diff_path}" || true
+    detail_message="normalized bundles differed"
+  else
+    detail_message="one or both normalized bundles were missing"
+  fi
+  record_assertion "A4" "The normalized bundles match exactly" "FAIL" "${diff_path}" "${detail_message}"
+fi
+
+status="pass"
+if [[ "${had_failure}" -ne 0 ]]; then
+  status="fail"
+fi
+
+jq -n \
+  --arg scenario "${scenario_id}" \
+  --arg run_id "${run_id}" \
+  --arg snapshot_label "${SNAPSHOT_LABEL}" \
+  --arg status "${status}" \
+  --arg generated_at "$(timestamp_utc)" \
+  '{
+    scenario: $scenario,
+    run_id: $run_id,
+    snapshot_label: $snapshot_label,
+    status: $status,
+    generated_at_utc: $generated_at,
+    assertions: [inputs]
+  }' "${assertions_jsonl_path}" >"${summary_path}"
+
+log "scenario 12 assert artifacts written to ${assert_dir}"

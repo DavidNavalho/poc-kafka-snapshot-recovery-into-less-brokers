@@ -51,4 +51,5 @@ If the change touches shared contracts, also read:
 - Scenario 03 is green on run `20260421T154928Z`.
 - Scenario 10 is green on run `20260421T162030Z`.
 - Scenario 11 is green on run `20260421T163100Z`.
-- The next implementation target is Scenario 12.
+- Scenario 12 is green on run `20260421T170720Z`.
+- All clean-stop scenarios are now green. Scenario 09 remains intentionally deferred.

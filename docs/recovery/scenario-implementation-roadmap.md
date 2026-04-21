@@ -25,6 +25,7 @@ This file is the current planning authority for:
 - Scenario 03 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T154928Z`.
 - Scenario 10 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T162030Z`.
 - Scenario 11 is now fully automated and has passed `run` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T163100Z`.
+- Scenario 12 is now fully automated and has passed `run` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T170720Z`.
 - Two important runtime issues were already found and fixed:
   - source and recovery clusters must not share the same Docker network namespace
   - copied metadata snapshot directories must be cleaned more aggressively before installing rewritten state
@@ -128,6 +129,7 @@ These are shared tasks that affect multiple scenarios and should be reused inste
 - a transactional probe that runs without introducing new host dependencies is now in place
 - deterministic reassignment payload generation for post-recovery expansion
 - fault-injection hooks for negative-path scenarios
+- repeatability bundle normalization and suite rerun comparison are now in place
 
 ## Scenario Backlog
 
@@ -382,7 +384,9 @@ Done gate:
 
 Current status:
 
-- ready now that Scenario 11 is green
+- implemented and validated from a fresh worktree
+- latest clean report: `docs/recovery/reports/runs/2026-04-21-scenario-12-20260421T170720Z.md`
+- normalized bundle generation, exact bundle diffing, and fail-fast rerun orchestration are now automated
 
 Spec before implementation:
 
@@ -391,15 +395,9 @@ Spec before implementation:
 - define whether both runs must use the exact same snapshot label and tool image hash
 - define how differences are surfaced in the report bundle
 
-Likely implementation focus:
-
-- report normalizer and diff helper
-- rerun orchestration from the same immutable snapshot
-- comparison artifact generation
-
 Done gate:
 
-- two runs from the same snapshot yield matching normalized results with only explicitly accepted nondeterminism
+- achieved on 2026-04-21 by run `20260421T170720Z`
 
 ### Scenario 09: Live Snapshot Extension
 

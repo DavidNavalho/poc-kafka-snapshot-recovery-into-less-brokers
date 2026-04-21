@@ -281,7 +281,7 @@ else
   record_assertion "A4" "Sampled partition prefixes match the deterministic seed pattern" "FAIL" "${sample_artifact_dir}" "$(printf '%s; ' "${a4_details[@]}" | sed 's/; $//')"
 fi
 
-corruption_pattern='CorruptRecordException|InvalidRecordException|crc|checksum|corrupt.*(log|segment|index)|Error while loading log|Found invalid messages'
+corruption_pattern='CorruptRecordException|InvalidRecordException|\\bcrc(32c?)?\\b|checksum|corrupt.*(log|segment|index)|Error while loading log|Found invalid messages'
 
 set +e
 write_scan_output "${recovery_log_path}" "${corruption_pattern}" "${corruption_scan_path}" "no corruption patterns detected"
