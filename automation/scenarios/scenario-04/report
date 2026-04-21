@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+require_cmd docker
+require_cmd jq
+
+scenario_id="scenario-04"
+run_id="${1:-}"
+
+[[ -n "${run_id}" ]] || fail "usage: automation/scenarios/scenario-04/report <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+
+summary_path="${WORKDIR}/artifacts/assert/assert-summary.json"
+snapshot_manifest_path="${WORKDIR}/snapshot-manifest.json"
+report_date="$(date -u +%F)"
+report_path="${REPORT_RUNS_ROOT}/${report_date}-scenario-04-${run_id}.md"
+recovery_image="$(jq -r '.image.vendor + "/" + .image.product + ":" + .image.tag' "${snapshot_manifest_path}")"
+source_fixture_version="$(jq -r '.source_fixture_version // "unknown"' "${snapshot_manifest_path}")"
+summary_status="$(jq -r '.status // "fail"' "${summary_path}")"
+docker_server_version="$(docker version --format '{{.Server.Version}}' 2>/dev/null || printf 'unknown')"
+docker_compose_version="$(docker compose version --short 2>/dev/null || printf 'unknown')"
+host_machine="$(hostname)"
+topic_name="recovery.consumer.test"
+partition_count="$(jq -r --arg topic "${topic_name}" '.topics[] | select(.name == $topic) | .partitions' "${snapshot_manifest_path}")"
+
+case "${summary_status}" in
+  pass) result_label="PASS" ;;
+  fail) result_label="FAIL" ;;
+  *) result_label="PARTIAL" ;;
+esac
+
+assertions_table="$(
+  jq -r '.assertions[] | [.name, .result, .evidence] | @tsv' "${summary_path}" | while IFS=$'\t' read -r name result evidence; do
+    printf '| %s | %s | `%s` |\n' "${name}" "${result}" "${evidence}"
+  done
+)"
+
+consumer_groups_block="$(
+  jq -r '.consumer_groups[] | "- `" + .group_id + "`: expected committed offset `" + (.expected_committed_offsets["0"] | tostring) + "` across `" + ((.expected_committed_offsets | length) | tostring) + "` partitions"' "${snapshot_manifest_path}"
+)"
+
+findings_block="- none"
+if [[ "${summary_status}" != "pass" ]]; then
+  findings_block="$(
+    jq -r '.assertions[] | select(.result != "PASS") | "- " + .name + ": " + (.details // "no details")' "${summary_path}"
+  )"
+fi
+
+follow_up_block="- Investigate the failing consumer-offset assertions before proceeding."
+if [[ "${summary_status}" == "pass" ]]; then
+  follow_up_block="- Proceed to Scenario 06."
+fi
+
+ensure_dir "${REPORT_RUNS_ROOT}"
+
+cat >"${report_path}" <<EOF
+# Scenario 04 Report
+
+## Summary
+
+- Scenario: scenario-04
+- Run ID: ${run_id}
+- Date: ${report_date}
+- Snapshot label: ${SNAPSHOT_LABEL}
+- Source fixture revision: ${source_fixture_version}
+- Recovery image version: ${recovery_image}
+- Result: ${result_label}
+
+## Environment
+
+- Host machine: ${host_machine}
+- Docker version: ${docker_server_version}
+- Compose version: ${docker_compose_version}
+- Relevant resource notes: scenario report generated from ${WORKDIR}
+
+## Procedure
+
+1. \`automation/recovery/prepare scenario-04 ${SNAPSHOT_LABEL} ${run_id}\`
+2. \`automation/recovery/rewrite scenario-04 ${run_id}\`
+3. \`automation/recovery/up scenario-04 ${run_id}\`
+4. \`automation/scenarios/scenario-04/assert ${run_id}\`
+5. \`automation/scenarios/scenario-04/report ${run_id}\`
+
+## Consumer Scope
+
+- Topic under test: \`${topic_name}\`
+- Partition count: \`${partition_count}\`
+- Canonical consumer groups:
+${consumer_groups_block}
+
+## Assertions
+
+| Assertion | Result | Evidence |
+|---|---|---|
+${assertions_table}
+
+## Artifacts
+
+- Consumer group describe and normalized offsets: \`${WORKDIR}/artifacts/assert/groups/\`
+- Resume probe outputs: \`${WORKDIR}/artifacts/assert/probes/\`
+- Recovery logs: \`${WORKDIR}/artifacts/recovery/docker-compose.log\`
+- Recovery compose state: \`${WORKDIR}/artifacts/assert/recovery-ps.txt\`
+
+## Findings
+
+${findings_block}
+
+## Follow-Up
+
+${follow_up_block}
+EOF
+
+log "scenario 04 report written to ${report_path}"

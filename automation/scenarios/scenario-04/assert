@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+require_cmd docker
+require_cmd jq
+
+scenario_id="scenario-04"
+run_id="${1:-}"
+
+[[ -n "${run_id}" ]] || fail "usage: automation/scenarios/scenario-04/assert <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+export RECOVERY_WORKDIR="${WORKDIR}"
+
+assert_dir="${WORKDIR}/artifacts/assert"
+group_artifact_dir="${assert_dir}/groups"
+probe_artifact_dir="${assert_dir}/probes"
+recovery_artifact_dir="${WORKDIR}/artifacts/recovery"
+recovery_log_path="${recovery_artifact_dir}/docker-compose.log"
+recovery_ps_path="${assert_dir}/recovery-ps.txt"
+assertions_jsonl_path="${assert_dir}/assertions.jsonl"
+summary_path="${assert_dir}/assert-summary.json"
+snapshot_manifest_path="${WORKDIR}/snapshot-manifest.json"
+
+ensure_dir "${assert_dir}"
+ensure_dir "${group_artifact_dir}"
+ensure_dir "${probe_artifact_dir}"
+ensure_dir "${recovery_artifact_dir}"
+: >"${assertions_jsonl_path}"
+
+readonly GROUP_TOPIC="recovery.consumer.test"
+readonly GROUP_IDS=(
+  "recovery.group.25"
+  "recovery.group.50"
+  "recovery.group.75"
+)
+readonly GROUP_STABILIZE_ATTEMPTS="${GROUP_STABILIZE_ATTEMPTS:-30}"
+readonly GROUP_STABILIZE_SLEEP_SECONDS="${GROUP_STABILIZE_SLEEP_SECONDS:-2}"
+
+had_failure=0
+
+record_assertion() {
+  local id="$1"
+  local name="$2"
+  local result="$3"
+  local evidence="$4"
+  local details="$5"
+
+  if [[ "${result}" != "PASS" ]]; then
+    had_failure=1
+  fi
+
+  jq -nc \
+    --arg id "${id}" \
+    --arg name "${name}" \
+    --arg result "${result}" \
+    --arg evidence "${evidence}" \
+    --arg details "${details}" \
+    '{id: $id, name: $name, result: $result, evidence: $evidence, details: $details}' >>"${assertions_jsonl_path}"
+}
+
+capture_recovery_state() {
+  recovery_compose "${RECOVERY_PROJECT}" logs --no-color >"${recovery_log_path}" || true
+  recovery_compose "${RECOVERY_PROJECT}" ps >"${recovery_ps_path}" || true
+}
+
+manifest_topic_json() {
+  local topic_name="$1"
+  jq -cer --arg topic "${topic_name}" '.topics[] | select(.name == $topic)' "${snapshot_manifest_path}"
+}
+
+manifest_group_json() {
+  local group_id="$1"
+  jq -cer --arg group_id "${group_id}" '.consumer_groups[] | select(.group_id == $group_id)' "${snapshot_manifest_path}"
+}
+
+expected_partition_count() {
+  manifest_topic_json "${GROUP_TOPIC}" | jq -r '.partitions'
+}
+
+expected_group_offsets_json() {
+  local group_id="$1"
+  manifest_group_json "${group_id}" | jq -cS '.expected_committed_offsets'
+}
+
+capture_group_describe() {
+  local group_id="$1"
+  local output_path="$2"
+  local expected_count="$3"
+  local attempt line_count
+
+  for attempt in $(seq 1 "${GROUP_STABILIZE_ATTEMPTS}"); do
+    if recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 \
+      kafka-consumer-groups --bootstrap-server kafka-0:9092 --describe --group "${group_id}" </dev/null >"${output_path}" 2>&1; then
+      line_count="$(awk -v group="${group_id}" -v topic="${GROUP_TOPIC}" '
+        $1 == group && $2 == topic && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ { count++ }
+        END { print count + 0 }
+      ' "${output_path}")"
+      if [[ "${line_count}" == "${expected_count}" ]]; then
+        return 0
+      fi
+    fi
+    sleep "${GROUP_STABILIZE_SLEEP_SECONDS}"
+  done
+
+  return 1
+}
+
+normalize_group_offsets() {
+  local group_id="$1"
+  local raw_path="$2"
+  local output_path="$3"
+  local actual_json='{}'
+  local partition_id actual_offset
+
+  while IFS=$'\t' read -r partition_id _; do
+    actual_offset="$(
+      awk -v group="${group_id}" -v topic="${GROUP_TOPIC}" -v partition="${partition_id}" '
+        $1 == group && $2 == topic && $3 == partition && $4 ~ /^[0-9]+$/ { print $4; exit }
+      ' "${raw_path}"
+    )"
+    if [[ -n "${actual_offset}" ]]; then
+      actual_json="$(jq -c --arg key "${partition_id}" --argjson value "${actual_offset}" '. + {($key): $value}' <<<"${actual_json}")"
+    fi
+  done < <(manifest_group_json "${group_id}" | jq -r '.expected_committed_offsets | to_entries[] | [.key, (.value | tostring)] | @tsv')
+
+  jq -S . <<<"${actual_json}" >"${output_path}"
+}
+
+capture_resume_probe() {
+  local group_id="$1"
+  local partition_count="$2"
+  local output_path="$3"
+
+  recovery_toolbox_python "${RECOVERY_PROJECT}" "${REPO_ROOT}/automation/lib/probe_consumer_group_resume.py" resume \
+    --bootstrap-server kafka-0:9092 \
+    --group-id "${group_id}" \
+    --topic "${GROUP_TOPIC}" \
+    --partition-count "${partition_count}" \
+    --timeout-seconds 45 >"${output_path}"
+}
+
+capture_recovery_state
+
+partition_count="$(expected_partition_count)"
+a1_details=()
+a2_details=()
+
+for group_id in "${GROUP_IDS[@]}"; do
+  expected_path="${group_artifact_dir}/${group_id}.expected.json"
+  raw_path="${group_artifact_dir}/${group_id}.describe.txt"
+  committed_path="${group_artifact_dir}/${group_id}.committed.json"
+
+  if ! manifest_group_json "${group_id}" >/dev/null 2>&1; then
+    a1_details+=("${group_id}:missing-from-manifest")
+    a2_details+=("${group_id}:missing-from-manifest")
+    continue
+  fi
+
+  group_topic="$(manifest_group_json "${group_id}" | jq -r '.topic')"
+  [[ "${group_topic}" == "${GROUP_TOPIC}" ]] || a1_details+=("${group_id}:unexpected-topic=${group_topic}")
+
+  expected_json="$(expected_group_offsets_json "${group_id}")"
+  jq -S . <<<"${expected_json}" >"${expected_path}"
+
+  if ! capture_group_describe "${group_id}" "${raw_path}" "${partition_count}"; then
+    a1_details+=("${group_id}:describe-not-stable")
+    a2_details+=("${group_id}:describe-not-stable")
+    continue
+  fi
+
+  actual_line_count="$(awk -v group="${group_id}" -v topic="${GROUP_TOPIC}" '
+    $1 == group && $2 == topic && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ { count++ }
+    END { print count + 0 }
+  ' "${raw_path}")"
+  [[ "${actual_line_count}" == "${partition_count}" ]] || a1_details+=("${group_id}:partition-count=${actual_line_count}")
+
+  normalize_group_offsets "${group_id}" "${raw_path}" "${committed_path}"
+  actual_json="$(jq -cS . "${committed_path}")"
+  [[ "${actual_json}" == "${expected_json}" ]] || a2_details+=("${group_id}:expected=${expected_json}:actual=${actual_json}")
+done
+
+if [[ "${#a1_details[@]}" -eq 0 ]]; then
+  record_assertion "A1" "Canonical consumer groups are present and fully described" "PASS" "${group_artifact_dir}" "all canonical consumer groups stabilized and exposed numeric committed offsets for every expected partition"
+else
+  record_assertion "A1" "Canonical consumer groups are present and fully described" "FAIL" "${group_artifact_dir}" "$(printf '%s; ' "${a1_details[@]}" | sed 's/; $//')"
+fi
+
+if [[ "${#a2_details[@]}" -eq 0 ]]; then
+  record_assertion "A2" "Recovered committed offsets match the manifest exactly" "PASS" "${group_artifact_dir}" "all canonical consumer-group offsets matched the snapshot manifest exactly"
+else
+  record_assertion "A2" "Recovered committed offsets match the manifest exactly" "FAIL" "${group_artifact_dir}" "$(printf '%s; ' "${a2_details[@]}" | sed 's/; $//')"
+fi
+
+a3_details=()
+for group_id in "${GROUP_IDS[@]}"; do
+  if ! manifest_group_json "${group_id}" >/dev/null 2>&1; then
+    a3_details+=("${group_id}:missing-from-manifest")
+    continue
+  fi
+
+  expected_json="$(expected_group_offsets_json "${group_id}")"
+  probe_path="${probe_artifact_dir}/${group_id}.resume.json"
+
+  if ! capture_resume_probe "${group_id}" "${partition_count}" "${probe_path}"; then
+    :
+  fi
+
+  if [[ ! -f "${probe_path}" ]]; then
+    a3_details+=("${group_id}:probe-output-missing")
+    continue
+  fi
+
+  actual_json="$(jq -cS '.first_seen_offsets // {}' "${probe_path}")"
+  missing_count="$(jq -r '(.missing_partitions // []) | length' "${probe_path}")"
+  error_count="$(jq -r '(.errors // []) | length' "${probe_path}")"
+
+  [[ "${actual_json}" == "${expected_json}" ]] || a3_details+=("${group_id}:expected=${expected_json}:actual=${actual_json}")
+  [[ "${missing_count}" == "0" ]] || a3_details+=("${group_id}:missing-partitions=$(jq -c '.missing_partitions' "${probe_path}")")
+  [[ "${error_count}" == "0" ]] || a3_details+=("${group_id}:errors=$(jq -c '.errors' "${probe_path}")")
+done
+
+if [[ "${#a3_details[@]}" -eq 0 ]]; then
+  record_assertion "A3" "Resumed consumers start exactly at the inherited offsets" "PASS" "${probe_artifact_dir}" "resume probes observed the inherited committed offset on every partition for all canonical groups"
+else
+  record_assertion "A3" "Resumed consumers start exactly at the inherited offsets" "FAIL" "${probe_artifact_dir}" "$(printf '%s; ' "${a3_details[@]}" | sed 's/; $//')"
+fi
+
+summary_status="pass"
+if [[ "${had_failure}" -ne 0 ]]; then
+  summary_status="fail"
+fi
+
+jq -s \
+  --arg scenario "${scenario_id}" \
+  --arg run_id "${run_id}" \
+  --arg snapshot_label "${SNAPSHOT_LABEL}" \
+  --arg status "${summary_status}" \
+  --arg generated_at_utc "$(timestamp_utc)" \
+  '{
+    scenario: $scenario,
+    run_id: $run_id,
+    snapshot_label: $snapshot_label,
+    status: $status,
+    generated_at_utc: $generated_at_utc,
+    assertions: .
+  }' "${assertions_jsonl_path}" >"${summary_path}"
+
+log "scenario 04 assert artifacts written to ${assert_dir}"
+
+if [[ "${summary_status}" != "pass" ]]; then
+  exit 1
+fi

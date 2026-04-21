@@ -323,6 +323,13 @@ source_toolbox_python() {
 }
 
 
+recovery_toolbox_python() {
+  local project_name="$1"
+  shift
+  toolbox_python_with_network "${project_name}_harness" "$@"
+}
+
+
 copy_tree() {
   local source_path="$1"
   local target_path="$2"

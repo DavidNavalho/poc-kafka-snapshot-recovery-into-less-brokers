@@ -16,11 +16,12 @@ The repo is no longer spec-only. The current state is:
 - the snapshot rewrite tool exists behind `bin/snapshot-rewrite-tool` and is implemented under `tooling/snapshot-rewrite/`
 - Scenario 01 is fully automated and passed cleanly on 2026-04-21 with run ID `20260421T084355Z`
 - Scenario 02 is fully automated and passed cleanly on 2026-04-21 with run ID `20260421T095313Z`
+- Scenario 04 is fully automated and passed cleanly on 2026-04-21 with run ID `20260421T134100Z`
 - Scenario 05 is fully automated and passed cleanly on 2026-04-21 with run ID `20260421T113800Z`
 - Scenario 08 is fully automated and passed cleanly on 2026-04-21 with run ID `20260421T131900Z`
 - the harness now supports worktree-friendly root overrides so scenario work can run from a dedicated Git worktree while still pointing at shared snapshot artifacts
 
-Use [`scenario-implementation-roadmap.md`](./scenario-implementation-roadmap.md) as the authoritative execution plan. Scenario 01, Scenario 02, Scenario 05, and Scenario 08 are now the completed anchors; Scenario 04 is the next implementation target.
+Use [`scenario-implementation-roadmap.md`](./scenario-implementation-roadmap.md) as the authoritative execution plan. Scenario 01, Scenario 02, Scenario 04, Scenario 05, and Scenario 08 are now the completed anchors; Scenario 06 is the next implementation target.
 
 ## Implemented Files
 
@@ -42,6 +43,7 @@ Use [`scenario-implementation-roadmap.md`](./scenario-implementation-roadmap.md)
 - `automation/lib/checkpoint_tool.py`
 - `automation/lib/generate_fixture_records.py`
 - `automation/lib/seed_transactions.py`
+- `automation/lib/probe_consumer_group_resume.py`
 
 ### Source Cluster Commands
 
@@ -67,6 +69,8 @@ Use [`scenario-implementation-roadmap.md`](./scenario-implementation-roadmap.md)
 - `automation/tests/scenario_01_report_test.sh`
 - `automation/tests/scenario_02_assert_test.sh`
 - `automation/tests/scenario_02_report_test.sh`
+- `automation/tests/scenario_04_assert_test.sh`
+- `automation/tests/scenario_04_report_test.sh`
 - `automation/tests/scenario_05_assert_test.sh`
 - `automation/tests/scenario_05_report_test.sh`
 - `automation/tests/scenario_08_assert_test.sh`
@@ -127,7 +131,17 @@ These checks were completed successfully:
   - `automation/recovery/up scenario-02 20260421T095313Z`
   - `automation/scenarios/scenario-02/assert 20260421T095313Z`
   - `automation/scenarios/scenario-02/report 20260421T095313Z`
+- targeted Scenario 04 shell tests:
+  - `bash automation/tests/scenario_04_assert_test.sh`
+  - `bash automation/tests/scenario_04_report_test.sh`
 - containerized `tooling/snapshot-rewrite` Maven test suite after the Scenario 05 metadata-log boundary fix
+- real Scenario 04 recovery boot, assert, and report after:
+  - `SNAPSHOTS_ROOT=/private/tmp/poc-kafka-snapshot-recovery-scenario-05/fixtures/snapshots automation/recovery/prepare scenario-04 baseline-clean-v2 20260421T134100Z`
+  - `automation/recovery/rewrite scenario-04 20260421T134100Z`
+  - `automation/recovery/up scenario-04 20260421T134100Z`
+  - `automation/scenarios/scenario-04/assert 20260421T134100Z`
+  - `automation/scenarios/scenario-04/report 20260421T134100Z`
+  - `automation/recovery/down scenario-04 20260421T134100Z`
 - real Scenario 05 recovery boot, assert, and report after:
   - `automation/recovery/prepare scenario-05 baseline-clean-v2 20260421T113800Z`
   - `automation/recovery/rewrite scenario-05 20260421T113800Z`
@@ -149,7 +163,7 @@ Important runtime detail:
 
 ## Known Gaps
 
-- Scenarios 03, 04, 06, 07, 10, 11, and 12 are still planned work
+- Scenarios 03, 06, 07, 10, 11, and 12 are still planned work
 - Scenario 03 still needs an explicit, reproducible fault-injection mechanism
 - Scenario 07 still needs a no-host-dependency transactional probe
 - Scenario 11 and Scenario 12 still need a report bundle convention and normalized diff strategy
@@ -176,7 +190,7 @@ From repo root:
 ```bash
 sed -n '1,220p' AGENTS.md
 sed -n '1,260p' docs/recovery/scenario-implementation-roadmap.md
-sed -n '1,220p' docs/recovery/scenarios/scenario-04-consumer-offset-continuity.md
+sed -n '1,220p' docs/recovery/scenarios/scenario-06-compacted-topic-recovery.md
 ```
 
 The latest green reports are:
@@ -184,6 +198,7 @@ The latest green reports are:
 ```bash
 sed -n '1,220p' docs/recovery/reports/runs/2026-04-21-scenario-01-20260421T084355Z.md
 sed -n '1,220p' docs/recovery/reports/runs/2026-04-21-scenario-02-20260421T095313Z.md
+sed -n '1,220p' docs/recovery/reports/runs/2026-04-21-scenario-04-20260421T134100Z.md
 sed -n '1,220p' docs/recovery/reports/runs/2026-04-21-scenario-05-20260421T113800Z.md
 sed -n '1,220p' docs/recovery/reports/runs/2026-04-21-scenario-08-20260421T131900Z.md
 ```
@@ -191,7 +206,7 @@ sed -n '1,220p' docs/recovery/reports/runs/2026-04-21-scenario-08-20260421T13190
 Then resume from the next scenario:
 
 ```bash
-sed -n '1,260p' docs/recovery/scenarios/scenario-04-consumer-offset-continuity.md
+sed -n '1,260p' docs/recovery/scenarios/scenario-06-compacted-topic-recovery.md
 ```
 
 `<run-id>` is written into `fixtures/scenario-runs/<scenario-id>/<run-id>/run.env` by `automation/recovery/prepare`.
@@ -221,6 +236,6 @@ sed -n '1,260p' docs/recovery/scenarios/scenario-04-consumer-offset-continuity.m
 
 ## Git Notes
 
-- current branch in the active Scenario 08 worktree: `scenario-08`
+- current branch in the active Scenario 04 worktree: `scenario-04`
 - remote: `origin`
 - local `.claude/` contains Claude worktree metadata and should stay out of normal repo commits

@@ -16,7 +16,7 @@ Short, human-readable summaries live under
 | 01 | [scenario-01-quorum-and-metadata.md](./scenario-01-quorum-and-metadata.md) | Prove the rewritten metadata boots as a 3-node KRaft cluster | 1 | Implemented |
 | 02 | [scenario-02-partition-data-integrity.md](./scenario-02-partition-data-integrity.md) | Prove copied partition data is readable and offsets match the source manifest | 1 | Implemented |
 | 03 | [scenario-03-stray-detection-safety-net.md](./scenario-03-stray-detection-safety-net.md) | Prove stray detection is avoided in the happy path and recoverable in a fault-injected case | 1 | Planned |
-| 04 | [scenario-04-consumer-offset-continuity.md](./scenario-04-consumer-offset-continuity.md) | Prove consumer groups resume from inherited offsets | 1 | Planned |
+| 04 | [scenario-04-consumer-offset-continuity.md](./scenario-04-consumer-offset-continuity.md) | Prove consumer groups resume from inherited offsets | 1 | Implemented |
 | 05 | [scenario-05-config-preservation.md](./scenario-05-config-preservation.md) | Prove topic and broker dynamic configs survive the rewrite | 1 | Implemented |
 | 06 | [scenario-06-compacted-topic-recovery.md](./scenario-06-compacted-topic-recovery.md) | Prove compacted topics retain latest-per-key data | 1 | Planned |
 | 07 | [scenario-07-transaction-state-recovery.md](./scenario-07-transaction-state-recovery.md) | Prove transaction state survives and new transactional producers work | 1 | Planned |
@@ -39,5 +39,6 @@ Short, human-readable summaries live under
 
 - [Scenario 01 Report Card](./report-cards/scenario-01-report-card.md)
 - [Scenario 02 Report Card](./report-cards/scenario-02-report-card.md)
+- [Scenario 04 Report Card](./report-cards/scenario-04-report-card.md)
 - [Scenario 05 Report Card](./report-cards/scenario-05-report-card.md)
 - [Scenario 08 Report Card](./report-cards/scenario-08-report-card.md)

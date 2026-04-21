@@ -17,6 +17,7 @@ This file is the current planning authority for:
 - The snapshot rewrite tool now exists behind [`bin/snapshot-rewrite-tool`](../../bin/snapshot-rewrite-tool) with implementation under [`tooling/snapshot-rewrite/`](../../tooling/snapshot-rewrite/).
 - Scenario 01 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh copied snapshot workdir.
 - Scenario 02 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T095313Z`.
+- Scenario 04 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T134100Z`.
 - Scenario 05 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T113800Z`.
 - Scenario 08 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T131900Z`.
 - Two important runtime issues were already found and fixed:
@@ -117,7 +118,7 @@ These are shared tasks that affect multiple scenarios and should be reused inste
 
 - report bundle normalization for offsets, configs, and logs
 - helpers for topic describe, offset capture, and sampled consumption
-- helpers for consumer-group describe and resume probes
+- helpers for consumer-group describe and resume probes are now in place
 - helpers for compacted-topic reconstruction from consumed records
 - a transactional probe that runs without introducing new host dependencies
 - deterministic reassignment payload generation for post-recovery expansion
@@ -233,8 +234,9 @@ Done gate:
 
 Current status:
 
-- not automated yet
-- depends on Scenario 02 and on stable manifest capture for committed offsets
+- implemented and validated from a fresh worktree
+- latest clean report: `docs/recovery/reports/runs/2026-04-21-scenario-04-20260421T134100Z.md`
+- manifest-backed committed-offset equality and containerized resumed-consumer probes are now automated
 
 Spec before implementation:
 
@@ -243,15 +245,13 @@ Spec before implementation:
 - define what "resume near inherited offsets" means numerically
 - define the wait or retry rule for `__consumer_offsets` stabilization
 
-Likely implementation focus:
+Success contract:
 
-- consumer-group describe helper
-- manifest comparison for committed offsets
-- resumed-consumer probe using recovered group IDs
+- recovered committed offsets match the manifest exactly and resumed consumers start from the inherited position with zero drift in the clean-stop happy path
 
 Done gate:
 
-- recovered committed offsets are present and resumed consumers start from the inherited position within the declared tolerance
+- achieved on 2026-04-21 by run `20260421T134100Z`
 
 ### Scenario 06: Compacted Topic Recovery
 
