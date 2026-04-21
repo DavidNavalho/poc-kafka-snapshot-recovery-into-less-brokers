@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+require_cmd docker
+require_cmd jq
+require_cmd rg
+
+scenario_id="scenario-07"
+run_id="${1:-}"
+
+[[ -n "${run_id}" ]] || fail "usage: automation/scenarios/scenario-07/assert <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+export RECOVERY_WORKDIR="${WORKDIR}"
+
+assert_dir="${WORKDIR}/artifacts/assert"
+probe_artifact_dir="${assert_dir}/probes"
+txn_state_artifact_dir="${assert_dir}/transaction-state"
+recovery_artifact_dir="${WORKDIR}/artifacts/recovery"
+recovery_log_path="${recovery_artifact_dir}/docker-compose.log"
+recovery_ps_path="${assert_dir}/recovery-ps.txt"
+assertions_jsonl_path="${assert_dir}/assertions.jsonl"
+summary_path="${assert_dir}/assert-summary.json"
+snapshot_manifest_path="${WORKDIR}/snapshot-manifest.json"
+
+ensure_dir "${assert_dir}"
+ensure_dir "${probe_artifact_dir}"
+ensure_dir "${txn_state_artifact_dir}"
+ensure_dir "${recovery_artifact_dir}"
+: >"${assertions_jsonl_path}"
+
+had_failure=0
+readonly TRANSACTION_STATE_TIMEOUT_SECONDS="${TRANSACTION_STATE_TIMEOUT_SECONDS:-45}"
+
+record_assertion() {
+  local id="$1"
+  local name="$2"
+  local result="$3"
+  local evidence="$4"
+  local details="$5"
+
+  if [[ "${result}" != "PASS" ]]; then
+    had_failure=1
+  fi
+
+  jq -nc \
+    --arg id "${id}" \
+    --arg name "${name}" \
+    --arg result "${result}" \
+    --arg evidence "${evidence}" \
+    --arg details "${details}" \
+    '{id: $id, name: $name, result: $result, evidence: $evidence, details: $details}' >>"${assertions_jsonl_path}"
+}
+
+capture_recovery_state() {
+  recovery_compose "${RECOVERY_PROJECT}" logs --no-color >"${recovery_log_path}" || true
+  recovery_compose "${RECOVERY_PROJECT}" ps >"${recovery_ps_path}" || true
+}
+
+txn_topic_json() {
+  jq -cer '.topics[] | select(.name == "recovery.txn.test")' "${snapshot_manifest_path}"
+}
+
+transactions_json() {
+  jq -cer '.transactions' "${snapshot_manifest_path}"
+}
+
+txn_topic_value() {
+  local jq_filter="$1"
+  txn_topic_json | jq -r "${jq_filter}"
+}
+
+transactions_value() {
+  local jq_filter="$1"
+  transactions_json | jq -r "${jq_filter}"
+}
+
+capture_transaction_state_topic() {
+  local output_path="$1"
+  recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 \
+    kafka-topics --bootstrap-server kafka-0:9092 --describe --topic __transaction_state </dev/null >"${output_path}"
+}
+
+capture_transactions_list() {
+  local output_path="$1"
+  recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 \
+    kafka-transactions --bootstrap-server kafka-0:9092 list </dev/null >"${output_path}"
+}
+
+capture_transaction_describe() {
+  local transactional_id="$1"
+  local output_path="$2"
+  recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 \
+    kafka-transactions --bootstrap-server kafka-0:9092 describe --transactional-id "${transactional_id}" </dev/null >"${output_path}" 2>&1
+}
+
+wait_for_transaction_state() {
+  local transactional_id="$1"
+  local expected_state="$2"
+  local output_path="$3"
+  local attempt
+
+  for attempt in $(seq 1 "${TRANSACTION_STATE_TIMEOUT_SECONDS}"); do
+    if capture_transaction_describe "${transactional_id}" "${output_path}"; then
+      actual_state="$(transaction_state_from_describe "${output_path}")"
+      if [[ "${actual_state}" == "${expected_state}" ]]; then
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+transaction_state_from_describe() {
+  local input_path="$1"
+  awk 'NR == 2 { print $5 }' "${input_path}"
+}
+
+transaction_list_contains_state() {
+  local input_path="$1"
+  local transactional_id="$2"
+  local expected_state="$3"
+  awk -v transactional_id="${transactional_id}" -v expected_state="${expected_state}" '
+    NR > 1 && $1 == transactional_id && $4 == expected_state { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "${input_path}"
+}
+
+transaction_state_topic_is_online() {
+  local input_path="$1"
+  awk '
+    /Partition:/ {
+      count++
+      if ($5 != "Leader:" || ($6 != "0" && $6 != "1" && $6 != "2")) {
+        exit 1
+      }
+    }
+    END { exit(count > 0 ? 0 : 1) }
+  ' "${input_path}"
+}
+
+capture_read_committed_probe() {
+  local phase="$1"
+  local output_path="$2"
+  recovery_toolbox_python "${RECOVERY_PROJECT}" "${REPO_ROOT}/automation/lib/probe_transaction_state.py" read-committed \
+    --bootstrap-server kafka-0:9092 \
+    --group-id "recovery.txn.read-committed.${run_id}.${phase}" \
+    --topic recovery.txn.test \
+    --timeout-seconds 45 >"${output_path}"
+}
+
+run_transactional_probe() {
+  local transactional_id="$1"
+  local output_path="$2"
+  local payload_bytes
+  payload_bytes="$(txn_topic_value '.payload_bytes')"
+  recovery_toolbox_python "${RECOVERY_PROJECT}" "${REPO_ROOT}/automation/lib/probe_transaction_state.py" transactional-commit \
+    --bootstrap-server kafka-0:9092 \
+    --topic recovery.txn.test \
+    --partitions 6 \
+    --payload-bytes "${payload_bytes}" \
+    --transactional-id "${transactional_id}" \
+    --probe-id "${run_id}" \
+    --timeout-seconds 45 >"${output_path}"
+}
+
+capture_recovery_state
+
+committed_transactional_id="$(transactions_value '.committed_transactional_id')"
+ongoing_transactional_id="$(transactions_value '.ongoing_transactional_id')"
+expected_total_messages="$(transactions_value '.expected_read_committed_total_messages')"
+expected_per_partition_json="$(txn_topic_json | jq -cS '.expected_read_committed_offsets')"
+expected_post_probe_total="$((expected_total_messages + 6))"
+expected_post_probe_partition_json="$(
+  jq -cn --argjson offsets "${expected_per_partition_json}" '
+    reduce ($offsets | to_entries[]) as $entry ({}; . + {($entry.key): ($entry.value + 1)})
+  ' | jq -cS .
+)"
+probe_transactional_id="recovery.txn.probe.scenario-07.${run_id}"
+
+transaction_state_topic_path="${txn_state_artifact_dir}/__transaction_state.describe.txt"
+transaction_list_initial_path="${txn_state_artifact_dir}/transactions.list.initial.txt"
+transaction_list_after_path="${txn_state_artifact_dir}/transactions.list.after.txt"
+committed_describe_path="${txn_state_artifact_dir}/${committed_transactional_id}.describe.txt"
+ongoing_describe_path="${txn_state_artifact_dir}/${ongoing_transactional_id}.describe.txt"
+probe_describe_path="${txn_state_artifact_dir}/${probe_transactional_id}.describe.txt"
+read_committed_before_path="${probe_artifact_dir}/recovery.txn.test.read-committed.before.json"
+read_committed_after_path="${probe_artifact_dir}/recovery.txn.test.read-committed.after.json"
+transactional_probe_path="${probe_artifact_dir}/transactional-probe.json"
+
+a1_details=()
+if ! capture_transaction_state_topic "${transaction_state_topic_path}"; then
+  a1_details+=("__transaction_state:describe-failed")
+else
+  transaction_state_topic_is_online "${transaction_state_topic_path}" || a1_details+=("__transaction_state:not-online")
+fi
+
+if ! capture_transactions_list "${transaction_list_initial_path}"; then
+  a1_details+=("transactions-list:command-failed")
+else
+  transaction_list_contains_state "${transaction_list_initial_path}" "${committed_transactional_id}" "CompleteCommit" || a1_details+=("${committed_transactional_id}:missing-from-list")
+  transaction_list_contains_state "${transaction_list_initial_path}" "${ongoing_transactional_id}" "CompleteAbort" || a1_details+=("${ongoing_transactional_id}:missing-from-list")
+fi
+
+if ! capture_transaction_describe "${committed_transactional_id}" "${committed_describe_path}"; then
+  a1_details+=("${committed_transactional_id}:describe-failed")
+else
+  [[ "$(transaction_state_from_describe "${committed_describe_path}")" == "CompleteCommit" ]] || a1_details+=("${committed_transactional_id}:state=$(transaction_state_from_describe "${committed_describe_path}")")
+fi
+
+if ! capture_transaction_describe "${ongoing_transactional_id}" "${ongoing_describe_path}"; then
+  a1_details+=("${ongoing_transactional_id}:describe-failed")
+fi
+
+if [[ "${#a1_details[@]}" -eq 0 ]]; then
+  record_assertion "A1" "__transaction_state is online and canonical transactional IDs remain inspectable" "PASS" "${txn_state_artifact_dir}" "__transaction_state is online and the canonical transactional IDs are inspectable"
+else
+  record_assertion "A1" "__transaction_state is online and canonical transactional IDs remain inspectable" "FAIL" "${txn_state_artifact_dir}" "$(printf '%s; ' "${a1_details[@]}" | sed 's/; $//')"
+fi
+
+a2_details=()
+if ! capture_read_committed_probe "before" "${read_committed_before_path}"; then
+  :
+fi
+
+if [[ ! -f "${read_committed_before_path}" ]]; then
+  a2_details+=("read-committed-before:probe-output-missing")
+else
+  [[ "$(jq -r '.total_messages' "${read_committed_before_path}")" == "${expected_total_messages}" ]] || a2_details+=("total=$(jq -r '.total_messages' "${read_committed_before_path}")")
+  [[ "$(jq -cS '.per_partition_counts' "${read_committed_before_path}")" == "${expected_per_partition_json}" ]] || a2_details+=("per-partition=$(jq -cS '.per_partition_counts' "${read_committed_before_path}")")
+  [[ "$(jq -r '.marker_counts.open' "${read_committed_before_path}")" == "0" ]] || a2_details+=("open-visible=$(jq -r '.marker_counts.open' "${read_committed_before_path}")")
+  [[ "$(jq -r '(.errors // []) | length' "${read_committed_before_path}")" == "0" ]] || a2_details+=("errors=$(jq -c '.errors' "${read_committed_before_path}")")
+  [[ "$(jq -r '(.eof_partitions // []) | length' "${read_committed_before_path}")" == "6" ]] || a2_details+=("eof-count=$(jq -r '(.eof_partitions // []) | length' "${read_committed_before_path}")")
+fi
+
+if [[ "${#a2_details[@]}" -eq 0 ]]; then
+  record_assertion "A2" "Initial read_committed visibility matches the manifest and hides open-transaction records" "PASS" "${read_committed_before_path}" "read_committed visibility matched the manifest exactly"
+else
+  record_assertion "A2" "Initial read_committed visibility matches the manifest and hides open-transaction records" "FAIL" "${read_committed_before_path}" "$(printf '%s; ' "${a2_details[@]}" | sed 's/; $//')"
+fi
+
+a3_details=()
+if ! wait_for_transaction_state "${ongoing_transactional_id}" "CompleteAbort" "${ongoing_describe_path}"; then
+  a3_details+=("${ongoing_transactional_id}:state=$(transaction_state_from_describe "${ongoing_describe_path}" 2>/dev/null || printf 'unknown')")
+fi
+
+if [[ "${#a3_details[@]}" -eq 0 ]]; then
+  record_assertion "A3" "The canonical source-open transaction converges to CompleteAbort" "PASS" "${ongoing_describe_path}" "${ongoing_transactional_id} reached CompleteAbort"
+else
+  record_assertion "A3" "The canonical source-open transaction converges to CompleteAbort" "FAIL" "${ongoing_describe_path}" "$(printf '%s; ' "${a3_details[@]}" | sed 's/; $//')"
+fi
+
+a4_details=()
+if ! run_transactional_probe "${probe_transactional_id}" "${transactional_probe_path}"; then
+  :
+fi
+
+if [[ ! -f "${transactional_probe_path}" ]]; then
+  a4_details+=("transactional-probe:output-missing")
+else
+  [[ "$(jq -r '.init_transactions_status' "${transactional_probe_path}")" == "ok" ]] || a4_details+=("init-status=$(jq -r '.init_transactions_status' "${transactional_probe_path}")")
+  [[ "$(jq -r '.commit_transaction_status' "${transactional_probe_path}")" == "ok" ]] || a4_details+=("commit-status=$(jq -r '.commit_transaction_status' "${transactional_probe_path}")")
+  [[ "$(jq -r '(.errors // []) | length' "${transactional_probe_path}")" == "0" ]] || a4_details+=("probe-errors=$(jq -c '.errors' "${transactional_probe_path}")")
+  [[ "$(jq -r '(.delivered_partitions // []) | length' "${transactional_probe_path}")" == "6" ]] || a4_details+=("delivered-count=$(jq -r '(.delivered_partitions // []) | length' "${transactional_probe_path}")")
+fi
+
+if ! wait_for_transaction_state "${probe_transactional_id}" "CompleteCommit" "${probe_describe_path}"; then
+  a4_details+=("${probe_transactional_id}:state=$(transaction_state_from_describe "${probe_describe_path}" 2>/dev/null || printf 'unknown')")
+fi
+
+if ! capture_transactions_list "${transaction_list_after_path}"; then
+  a4_details+=("transactions-list-after:command-failed")
+fi
+
+if ! capture_read_committed_probe "after" "${read_committed_after_path}"; then
+  :
+fi
+
+if [[ ! -f "${read_committed_after_path}" ]]; then
+  a4_details+=("read-committed-after:probe-output-missing")
+else
+  [[ "$(jq -r '.total_messages' "${read_committed_after_path}")" == "${expected_post_probe_total}" ]] || a4_details+=("post-total=$(jq -r '.total_messages' "${read_committed_after_path}")")
+  [[ "$(jq -cS '.per_partition_counts' "${read_committed_after_path}")" == "${expected_post_probe_partition_json}" ]] || a4_details+=("post-per-partition=$(jq -cS '.per_partition_counts' "${read_committed_after_path}")")
+  [[ "$(jq -r '.marker_counts.open' "${read_committed_after_path}")" == "0" ]] || a4_details+=("post-open-visible=$(jq -r '.marker_counts.open' "${read_committed_after_path}")")
+  [[ "$(jq -r '.marker_counts.probe' "${read_committed_after_path}")" == "6" ]] || a4_details+=("post-probe-visible=$(jq -r '.marker_counts.probe' "${read_committed_after_path}")")
+  [[ "$(jq -r '(.errors // []) | length' "${read_committed_after_path}")" == "0" ]] || a4_details+=("post-errors=$(jq -c '.errors' "${read_committed_after_path}")")
+fi
+
+if [[ "${#a4_details[@]}" -eq 0 ]]; then
+  record_assertion "A4" "A new transactional producer can initialize, commit, and become visible to read_committed" "PASS" "${transactional_probe_path}" "the post-recovery transactional probe committed successfully and became visible to read_committed"
+else
+  record_assertion "A4" "A new transactional producer can initialize, commit, and become visible to read_committed" "FAIL" "${transactional_probe_path}" "$(printf '%s; ' "${a4_details[@]}" | sed 's/; $//')"
+fi
+
+capture_recovery_state
+
+summary_status="pass"
+if [[ "${had_failure}" -ne 0 ]]; then
+  summary_status="fail"
+fi
+
+jq -s \
+  --arg scenario "${scenario_id}" \
+  --arg run_id "${run_id}" \
+  --arg snapshot_label "${SNAPSHOT_LABEL}" \
+  --arg status "${summary_status}" \
+  --arg generated_at_utc "$(timestamp_utc)" \
+  '{
+    scenario: $scenario,
+    run_id: $run_id,
+    snapshot_label: $snapshot_label,
+    status: $status,
+    generated_at_utc: $generated_at_utc,
+    assertions: .
+  }' "${assertions_jsonl_path}" >"${summary_path}"
+
+log "scenario 07 assert artifacts written to ${assert_dir}"
+
+if [[ "${summary_status}" != "pass" ]]; then
+  exit 1
+fi

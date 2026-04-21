@@ -20,6 +20,7 @@ This file is the current planning authority for:
 - Scenario 04 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T134100Z`.
 - Scenario 05 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T113800Z`.
 - Scenario 06 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T141350Z`.
+- Scenario 07 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T143125Z`.
 - Scenario 08 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T131900Z`.
 - Two important runtime issues were already found and fixed:
   - source and recovery clusters must not share the same Docker network namespace
@@ -121,7 +122,7 @@ These are shared tasks that affect multiple scenarios and should be reused inste
 - helpers for topic describe, offset capture, and sampled consumption
 - helpers for consumer-group describe and resume probes are now in place
 - helpers for compacted-topic reconstruction from consumed records
-- a transactional probe that runs without introducing new host dependencies
+- a transactional probe that runs without introducing new host dependencies is now in place
 - deterministic reassignment payload generation for post-recovery expansion
 - fault-injection hooks for negative-path scenarios
 
@@ -287,8 +288,9 @@ Done gate:
 
 Current status:
 
-- not automated yet
-- depends on stable Scenario 02 behavior and a repeatable transactional probe
+- implemented and validated from a fresh worktree
+- latest clean report: `docs/recovery/reports/runs/2026-04-21-scenario-07-20260421T143125Z.md`
+- transaction-state inspection, `read_committed` probes, and post-recovery transactional producer probes are now automated
 
 Spec before implementation:
 
@@ -303,9 +305,13 @@ Likely implementation focus:
 - `read_committed` verification for the transaction topic
 - transaction-state inspection and artifact capture
 
-Done gate:
+Success contract:
 
 - `__transaction_state` is healthy, committed records are visible via `read_committed`, unresolved transactions converge as expected, and a new transactional producer can initialize and commit
+
+Done gate:
+
+- achieved on 2026-04-21 by run `20260421T143125Z`
 
 ### Scenario 03: Stray Detection Safety Net
 

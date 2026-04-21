@@ -46,5 +46,6 @@ If the change touches shared contracts, also read:
 - Scenario 04 is green on run `20260421T134100Z`.
 - Scenario 05 is green on run `20260421T113800Z`.
 - Scenario 06 is green on run `20260421T141350Z`.
+- Scenario 07 is green on run `20260421T143125Z`.
 - Scenario 08 is green on run `20260421T131900Z`.
-- The next implementation target is Scenario 07.
+- The next implementation target is Scenario 03.

@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+scenario_id="scenario-07"
+run_id="${1:-}"
+
+[[ -n "${run_id}" ]] || fail "usage: automation/scenarios/scenario-07/report <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+export RECOVERY_WORKDIR="${WORKDIR}"
+
+summary_path="${WORKDIR}/artifacts/assert/assert-summary.json"
+snapshot_manifest_path="${WORKDIR}/snapshot-manifest.json"
+report_date="$(date -u +"%Y-%m-%d")"
+report_path="${REPORT_RUNS_ROOT}/${report_date}-scenario-07-${run_id}.md"
+
+[[ -f "${summary_path}" ]] || fail "assert summary missing: ${summary_path}"
+[[ -f "${snapshot_manifest_path}" ]] || fail "snapshot manifest missing: ${snapshot_manifest_path}"
+
+ensure_dir "${REPORT_RUNS_ROOT}"
+
+safe_jq_raw() {
+  local filter="$1"
+  local input_path="$2"
+  if [[ ! -f "${input_path}" ]]; then
+    printf 'n/a\n'
+    return 0
+  fi
+  jq -r "${filter}" "${input_path}" 2>/dev/null || printf 'n/a\n'
+}
+
+safe_describe_state() {
+  local input_path="$1"
+  if [[ ! -f "${input_path}" ]]; then
+    printf 'n/a\n'
+    return 0
+  fi
+  awk 'NR == 2 { print $5 }' "${input_path}" 2>/dev/null || printf 'n/a\n'
+}
+
+status="$(jq -r '.status' "${summary_path}")"
+checkpoint_basename="$(jq -r '.basename' "${SELECTED_CHECKPOINT_JSON}")"
+committed_transactional_id="$(jq -r '.transactions.committed_transactional_id' "${snapshot_manifest_path}")"
+ongoing_transactional_id="$(jq -r '.transactions.ongoing_transactional_id' "${snapshot_manifest_path}")"
+expected_total="$(jq -r '.transactions.expected_read_committed_total_messages' "${snapshot_manifest_path}")"
+before_total="$(safe_jq_raw '.total_messages' "${WORKDIR}/artifacts/assert/probes/recovery.txn.test.read-committed.before.json")"
+after_total="$(safe_jq_raw '.total_messages' "${WORKDIR}/artifacts/assert/probes/recovery.txn.test.read-committed.after.json")"
+probe_transactional_id="$(safe_jq_raw '.transactional_id' "${WORKDIR}/artifacts/assert/probes/transactional-probe.json")"
+probe_commit_status="$(safe_jq_raw '.commit_transaction_status' "${WORKDIR}/artifacts/assert/probes/transactional-probe.json")"
+committed_state="$(safe_describe_state "${WORKDIR}/artifacts/assert/transaction-state/${committed_transactional_id}.describe.txt")"
+ongoing_state="$(safe_describe_state "${WORKDIR}/artifacts/assert/transaction-state/${ongoing_transactional_id}.describe.txt")"
+probe_state="n/a"
+if [[ "${probe_transactional_id}" != "n/a" ]]; then
+  probe_state="$(safe_describe_state "${WORKDIR}/artifacts/assert/transaction-state/${probe_transactional_id}.describe.txt")"
+fi
+
+follow_up_block="- Investigate the failing transaction-state assertions before proceeding."
+if [[ "${status}" == "pass" ]]; then
+  follow_up_block="- Scenario 07 is green. The next implementation target is Scenario 03."
+fi
+
+cat >"${report_path}" <<EOF
+# Scenario 07 Report
+
+## Summary
+
+- Scenario: scenario-07
+- Run ID: \`${run_id}\`
+- Snapshot label: \`${SNAPSHOT_LABEL}\`
+- Selected checkpoint: \`${checkpoint_basename}\`
+- Result: \`${status}\`
+
+## Transaction Scope
+
+- Canonical committed transactional ID: \`${committed_transactional_id}\`
+- Canonical source-open transactional ID: \`${ongoing_transactional_id}\`
+- Post-recovery probe transactional ID: \`${probe_transactional_id}\`
+- Expected initial \`read_committed\` total messages: \`${expected_total}\`
+- Initial \`read_committed\` total messages: \`${before_total}\`
+- Post-probe \`read_committed\` total messages: \`${after_total}\`
+
+## Transaction States
+
+- \`${committed_transactional_id}\`: \`${committed_state}\`
+- \`${ongoing_transactional_id}\`: \`${ongoing_state}\`
+- \`${probe_transactional_id}\`: \`${probe_state}\`
+- Transactional probe commit status: \`${probe_commit_status}\`
+
+## Assertions
+
+$(jq -r '.assertions[] | "- \(.id) \(.name): \(.result) — \(.details)"' "${summary_path}")
+
+## Evidence
+
+- Transaction-state artifacts: \`${WORKDIR}/artifacts/assert/transaction-state/\`
+- Probe artifacts: \`${WORKDIR}/artifacts/assert/probes/\`
+- Assert summary: \`${summary_path}\`
+
+## Follow-Up
+
+${follow_up_block}
+EOF
+
+log "scenario 07 report written to ${report_path}"
