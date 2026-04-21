@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+require_cmd docker
+require_cmd jq
+require_cmd rg
+
+scenario_id="scenario-06"
+run_id="${1:-}"
+
+[[ -n "${run_id}" ]] || fail "usage: automation/scenarios/scenario-06/assert <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+export RECOVERY_WORKDIR="${WORKDIR}"
+
+assert_dir="${WORKDIR}/artifacts/assert"
+config_artifact_dir="${assert_dir}/configs"
+compacted_artifact_dir="${assert_dir}/compacted"
+recovery_artifact_dir="${WORKDIR}/artifacts/recovery"
+recovery_log_path="${recovery_artifact_dir}/docker-compose.log"
+recovery_ps_path="${assert_dir}/recovery-ps.txt"
+cleaner_scan_path="${assert_dir}/cleaner-scan.txt"
+assertions_jsonl_path="${assert_dir}/assertions.jsonl"
+summary_path="${assert_dir}/assert-summary.json"
+snapshot_manifest_path="${WORKDIR}/snapshot-manifest.json"
+
+ensure_dir "${assert_dir}"
+ensure_dir "${config_artifact_dir}"
+ensure_dir "${compacted_artifact_dir}"
+ensure_dir "${recovery_artifact_dir}"
+: >"${assertions_jsonl_path}"
+
+readonly COMPACTED_TOPICS=(
+  "recovery.compacted.accounts"
+  "recovery.compacted.orders"
+)
+readonly CLEANER_FAIL_PATTERN='error.*cleaner|cleaner.*error|exception.*cleaner|cleaner.*exception|cleaner thread .* exited'
+
+had_failure=0
+
+record_assertion() {
+  local id="$1"
+  local name="$2"
+  local result="$3"
+  local evidence="$4"
+  local details="$5"
+
+  if [[ "${result}" != "PASS" ]]; then
+    had_failure=1
+  fi
+
+  jq -nc \
+    --arg id "${id}" \
+    --arg name "${name}" \
+    --arg result "${result}" \
+    --arg evidence "${evidence}" \
+    --arg details "${details}" \
+    '{id: $id, name: $name, result: $result, evidence: $evidence, details: $details}' >>"${assertions_jsonl_path}"
+}
+
+capture_recovery_state() {
+  recovery_compose "${RECOVERY_PROJECT}" logs --no-color >"${recovery_log_path}" || true
+  recovery_compose "${RECOVERY_PROJECT}" ps >"${recovery_ps_path}" || true
+}
+
+manifest_topic_json() {
+  local topic_name="$1"
+  jq -cer --arg topic "${topic_name}" '.topics[] | select(.name == $topic)' "${snapshot_manifest_path}"
+}
+
+expected_topic_configs_json() {
+  local topic_name="$1"
+  manifest_topic_json "${topic_name}" | jq -cS '.configs // {}'
+}
+
+expectation_relative_path() {
+  local topic_name="$1"
+  jq -r --arg topic "${topic_name}" '.expectation_files.compacted_latest_values[$topic] // empty' "${snapshot_manifest_path}"
+}
+
+capture_config_dump() {
+  local topic_name="$1"
+  local output_path="$2"
+
+  if recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 \
+    kafka-configs --bootstrap-server kafka-0:9092 --entity-type topics --entity-name "${topic_name}" --describe </dev/null >"${output_path}"; then
+    return 0
+  fi
+
+  recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 \
+    kafka-configs --bootstrap-server kafka-0:9092 --entity-type topics --entity-name "${topic_name}" --describe --all </dev/null >"${output_path}"
+}
+
+normalize_dynamic_config_dump() {
+  local marker="$1"
+  local raw_path="$2"
+  local output_path="$3"
+  local normalized='{}'
+  local line key value synonyms
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" =~ ^[[:space:]]*([^=[:space:]]+)=([^[:space:]]+)[[:space:]]+sensitive=.*synonyms=\{(.*)\}$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      value="${BASH_REMATCH[2]}"
+      synonyms="${BASH_REMATCH[3]}"
+      [[ "${synonyms}" == *"${marker}${key}=${value}"* ]] || continue
+      normalized="$(jq -c --arg key "${key}" --arg value "${value}" '. + {($key): $value}' <<<"${normalized}")"
+    fi
+  done <"${raw_path}"
+
+  jq -S . <<<"${normalized}" >"${output_path}"
+}
+
+copy_expected_latest_values() {
+  local topic_name="$1"
+  local output_path="$2"
+  local relative_path source_path
+
+  relative_path="$(expectation_relative_path "${topic_name}")"
+  [[ -n "${relative_path}" ]] || fail "manifest expectation file missing for ${topic_name}"
+  source_path="${SNAPSHOT_SOURCE_ROOT}/${SNAPSHOT_LABEL}/${relative_path}"
+  [[ -f "${source_path}" ]] || fail "compacted expectation file missing: ${source_path}"
+  jq -S '.expected_latest_values' "${source_path}" >"${output_path}"
+}
+
+capture_compacted_probe() {
+  local topic_name="$1"
+  local output_path="$2"
+
+  recovery_toolbox_python "${RECOVERY_PROJECT}" "${REPO_ROOT}/automation/lib/probe_compacted_topic_state.py" latest-values \
+    --bootstrap-server kafka-0:9092 \
+    --group-id "recovery.compacted.probe.${run_id}.${topic_name}" \
+    --topic "${topic_name}" \
+    --timeout-seconds 45 >"${output_path}"
+}
+
+capture_recovery_state
+
+a1_details=()
+for topic_name in "${COMPACTED_TOPICS[@]}"; do
+  expected_json="$(expected_topic_configs_json "${topic_name}")" || {
+    a1_details+=("${topic_name}:missing-from-manifest")
+    continue
+  }
+
+  raw_path="${config_artifact_dir}/${topic_name}.config.txt"
+  normalized_path="${config_artifact_dir}/${topic_name}.normalized.json"
+
+  if ! capture_config_dump "${topic_name}" "${raw_path}"; then
+    a1_details+=("${topic_name}:config-command-failed")
+    continue
+  fi
+
+  normalize_dynamic_config_dump "DYNAMIC_TOPIC_CONFIG:" "${raw_path}" "${normalized_path}"
+  actual_json="$(jq -cS . "${normalized_path}")"
+  [[ "${actual_json}" == "${expected_json}" ]] || a1_details+=("${topic_name}:expected=${expected_json}:actual=${actual_json}")
+done
+
+if [[ "${#a1_details[@]}" -eq 0 ]]; then
+  record_assertion "A1" "Compacted topics retain the required dynamic compaction configs" "PASS" "${config_artifact_dir}" "all compacted topics matched the manifest-backed dynamic compaction configs exactly"
+else
+  record_assertion "A1" "Compacted topics retain the required dynamic compaction configs" "FAIL" "${config_artifact_dir}" "$(printf '%s; ' "${a1_details[@]}" | sed 's/; $//')"
+fi
+
+a2_details=()
+for topic_name in "${COMPACTED_TOPICS[@]}"; do
+  if ! manifest_topic_json "${topic_name}" >/dev/null 2>&1; then
+    a2_details+=("${topic_name}:missing-from-manifest")
+    continue
+  fi
+
+  expected_path="${compacted_artifact_dir}/${topic_name}.expected.json"
+  actual_path="${compacted_artifact_dir}/${topic_name}.actual.json"
+  replay_path="${compacted_artifact_dir}/${topic_name}.replay.json"
+
+  copy_expected_latest_values "${topic_name}" "${expected_path}"
+  expected_json="$(jq -cS . "${expected_path}")"
+
+  if ! capture_compacted_probe "${topic_name}" "${replay_path}"; then
+    :
+  fi
+
+  if [[ ! -f "${replay_path}" ]]; then
+    a2_details+=("${topic_name}:probe-output-missing")
+    continue
+  fi
+
+  jq -S '(.normalized_latest_values // .latest_values // {})' "${replay_path}" >"${actual_path}"
+  actual_json="$(jq -cS . "${actual_path}")"
+  [[ "${actual_json}" == "${expected_json}" ]] || a2_details+=("${topic_name}:expected=${expected_json}:actual=${actual_json}")
+
+  error_count="$(jq -r '(.errors // []) | length' "${replay_path}")"
+  eof_count="$(jq -r '(.eof_partitions // []) | length' "${replay_path}")"
+  [[ "${error_count}" == "0" ]] || a2_details+=("${topic_name}:errors=$(jq -c '.errors' "${replay_path}")")
+  [[ "${eof_count}" == "6" ]] || a2_details+=("${topic_name}:eof-count=${eof_count}")
+done
+
+if [[ "${#a2_details[@]}" -eq 0 ]]; then
+  record_assertion "A2" "Reconstructed latest-value maps match the snapshot expectation files exactly" "PASS" "${compacted_artifact_dir}" "all compacted-topic replay probes rebuilt the exact expected latest-value maps"
+else
+  record_assertion "A2" "Reconstructed latest-value maps match the snapshot expectation files exactly" "FAIL" "${compacted_artifact_dir}" "$(printf '%s; ' "${a2_details[@]}" | sed 's/; $//')"
+fi
+
+capture_recovery_state
+
+if [[ ! -f "${recovery_log_path}" ]]; then
+  printf 'recovery log missing: %s\n' "${recovery_log_path}" >"${cleaner_scan_path}"
+  record_assertion "A3" "Recovery logs show no narrow cleaner-failure patterns while compact topics are exercised" "FAIL" "${cleaner_scan_path}" "recovery log missing"
+else
+  if rg -ni --no-heading --color never "${CLEANER_FAIL_PATTERN}" "${recovery_log_path}" >"${cleaner_scan_path}"; then
+    record_assertion "A3" "Recovery logs show no narrow cleaner-failure patterns while compact topics are exercised" "FAIL" "${cleaner_scan_path}" "cleaner failure patterns detected in recovery logs"
+  else
+    printf 'no cleaner failure patterns detected\n' >"${cleaner_scan_path}"
+    record_assertion "A3" "Recovery logs show no narrow cleaner-failure patterns while compact topics are exercised" "PASS" "${cleaner_scan_path}" "no cleaner failure patterns were detected in the recovery logs"
+  fi
+fi
+
+summary_status="pass"
+if [[ "${had_failure}" -ne 0 ]]; then
+  summary_status="fail"
+fi
+
+jq -s \
+  --arg scenario "${scenario_id}" \
+  --arg run_id "${run_id}" \
+  --arg snapshot_label "${SNAPSHOT_LABEL}" \
+  --arg status "${summary_status}" \
+  --arg generated_at_utc "$(timestamp_utc)" \
+  '{
+    scenario: $scenario,
+    run_id: $run_id,
+    snapshot_label: $snapshot_label,
+    status: $status,
+    generated_at_utc: $generated_at_utc,
+    assertions: .
+  }' "${assertions_jsonl_path}" >"${summary_path}"
+
+log "scenario 06 assert artifacts written to ${assert_dir}"
+
+if [[ "${summary_status}" != "pass" ]]; then
+  exit 1
+fi

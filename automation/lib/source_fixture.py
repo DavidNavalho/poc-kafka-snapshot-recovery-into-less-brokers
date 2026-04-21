@@ -196,6 +196,7 @@ def _topic_entry(topic: dict) -> dict:
     elif topic["generator"] == "compacted-fixed-keys":
         entry["seed_plan"]["keys_per_partition"] = topic["keys_per_partition"]
         entry["seed_plan"]["versions_per_key"] = topic["versions_per_key"]
+        entry["key_prefix"] = topic["key_prefix"]
         entry["expected_latest_offsets"] = _partition_map(
             topic["partitions"], topic["keys_per_partition"] * topic["versions_per_key"]
         )

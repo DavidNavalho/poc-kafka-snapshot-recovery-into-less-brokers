@@ -17,6 +17,7 @@ import org.apache.kafka.common.metadata.BrokerRegistrationChangeRecord;
 import org.apache.kafka.common.metadata.NoOpRecord;
 import org.apache.kafka.common.metadata.PartitionChangeRecord;
 import org.apache.kafka.common.metadata.PartitionRecord;
+import org.apache.kafka.common.metadata.TopicRecord;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
 import org.apache.kafka.server.common.KRaftVersion;
 import org.apache.kafka.server.common.OffsetAndEpoch;
@@ -179,6 +180,54 @@ class MetadataLogSegmentWriterTest {
         assertEquals(List.of(DirectoryId.UNASSIGNED), rewritten.directories());
         assertEquals(List.of(), rewritten.eligibleLeaderReplicas());
         assertEquals(List.of(), rewritten.lastKnownElr());
+    }
+
+    @Test
+    void passesThroughNonPartitionMetadataTailRecordsUnchanged() throws Exception {
+        Path input = tempDir.resolve("input-topic-tail.log");
+        Path output = tempDir.resolve("output-topic-tail.log");
+        MetadataLogSegmentWriterTestSupport support = new MetadataLogSegmentWriterTestSupport();
+        Uuid topicId = Uuid.randomUuid();
+        support.writeSingleRecordBatches(
+            input,
+            8030L,
+            noOp(),
+            new ApiMessageAndVersion(new TopicRecord().setName("tail-topic").setTopicId(topicId), (short) 0)
+        );
+
+        new MetadataLogSegmentWriter().rewrite(input, output, emptySnapshot(8030L), options(List.of(0, 1, 2)));
+
+        List<MetadataLogSegmentWriterTestSupport.DecodedRecord> records = support.records(output);
+        assertEquals(List.of(8030L, 8031L), records.stream().map(MetadataLogSegmentWriterTestSupport.DecodedRecord::offset).toList());
+        assertInstanceOf(NoOpRecord.class, records.get(0).record().message());
+        TopicRecord topicRecord = assertInstanceOf(TopicRecord.class, records.get(1).record().message());
+        assertEquals("tail-topic", topicRecord.name());
+        assertEquals(topicId, topicRecord.topicId());
+    }
+
+    @Test
+    void rewritesRealMetadataTailThatContainsControlBatchAfterCheckpoint() throws Exception {
+        Path checkpoint = Path.of(
+            "..", "..", "fixtures", "snapshots", "baseline-clean-v3",
+            "brokers", "broker-0", "metadata", "__cluster_metadata-0",
+            "00000000000000001952-0000000001.checkpoint"
+        ).normalize();
+        Path input = checkpoint.resolveSibling("00000000000000000000.log");
+        Path output = tempDir.resolve("baseline-clean-v3-tail.log");
+        Assumptions.assumeTrue(Files.isRegularFile(checkpoint), "baseline-clean-v3 checkpoint fixture is not available in this test environment");
+        Assumptions.assumeTrue(Files.isRegularFile(input), "baseline-clean-v3 metadata log fixture is not available in this test environment");
+        CheckpointSnapshot snapshot = new CheckpointSnapshotReader().read(checkpoint);
+        MetadataLogSegmentWriterTestSupport support = new MetadataLogSegmentWriterTestSupport();
+
+        new MetadataLogSegmentWriter().rewrite(input, output, snapshot, options(List.of(0, 1, 2)));
+
+        List<MetadataLogSegmentWriterTestSupport.DecodedRecord> records = support.records(output);
+        assertEquals(11, records.size());
+        assertEquals(List.of(1952L, 1953L, 1954L, 1955L, 1956L, 1957L, 1958L, 1959L, 1960L, 1961L, 1962L),
+            records.stream().map(MetadataLogSegmentWriterTestSupport.DecodedRecord::offset).toList());
+        for (MetadataLogSegmentWriterTestSupport.DecodedRecord record : records) {
+            assertInstanceOf(NoOpRecord.class, record.record().message());
+        }
     }
 
     private RewriteOptions options(List<Integer> survivingBrokers) {

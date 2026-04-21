@@ -19,6 +19,7 @@ This file is the current planning authority for:
 - Scenario 02 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T095313Z`.
 - Scenario 04 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T134100Z`.
 - Scenario 05 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T113800Z`.
+- Scenario 06 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T141350Z`.
 - Scenario 08 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T131900Z`.
 - Two important runtime issues were already found and fixed:
   - source and recovery clusters must not share the same Docker network namespace
@@ -257,8 +258,9 @@ Done gate:
 
 Current status:
 
-- not automated yet
-- depends on Scenario 02 data-read plumbing and source-side latest-value expectations
+- implemented and validated from a fresh worktree
+- latest clean report: `docs/recovery/reports/runs/2026-04-21-scenario-06-20260421T141350Z.md`
+- compacted-topic replay, expectation-file comparison, and cleaner-log scanning are now automated
 
 Spec before implementation:
 
@@ -273,9 +275,13 @@ Likely implementation focus:
 - comparison logic against the stored compacted-topic expectation files
 - cleaner-log capture for failures
 
-Done gate:
+Success contract:
 
 - recovered latest-per-key state matches the expected compacted-topic manifest and the topic remains configured for compaction
+
+Done gate:
+
+- achieved on 2026-04-21 by run `20260421T141350Z`
 
 ### Scenario 07: Transaction State Recovery
 

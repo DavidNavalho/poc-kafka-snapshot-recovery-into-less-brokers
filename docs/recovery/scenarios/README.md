@@ -18,7 +18,7 @@ Short, human-readable summaries live under
 | 03 | [scenario-03-stray-detection-safety-net.md](./scenario-03-stray-detection-safety-net.md) | Prove stray detection is avoided in the happy path and recoverable in a fault-injected case | 1 | Planned |
 | 04 | [scenario-04-consumer-offset-continuity.md](./scenario-04-consumer-offset-continuity.md) | Prove consumer groups resume from inherited offsets | 1 | Implemented |
 | 05 | [scenario-05-config-preservation.md](./scenario-05-config-preservation.md) | Prove topic and broker dynamic configs survive the rewrite | 1 | Implemented |
-| 06 | [scenario-06-compacted-topic-recovery.md](./scenario-06-compacted-topic-recovery.md) | Prove compacted topics retain latest-per-key data | 1 | Planned |
+| 06 | [scenario-06-compacted-topic-recovery.md](./scenario-06-compacted-topic-recovery.md) | Prove compacted topics retain latest-per-key data | 1 | Implemented |
 | 07 | [scenario-07-transaction-state-recovery.md](./scenario-07-transaction-state-recovery.md) | Prove transaction state survives and new transactional producers work | 1 | Planned |
 | 08 | [scenario-08-multiple-log-directories.md](./scenario-08-multiple-log-directories.md) | Prove the recovery works with two log directories per broker | 1 | Implemented |
 | 09 | [scenario-09-live-snapshot-extension.md](./scenario-09-live-snapshot-extension.md) | Extend the harness to crash-consistent live-copy behavior | 2 | Deferred |
@@ -41,4 +41,5 @@ Short, human-readable summaries live under
 - [Scenario 02 Report Card](./report-cards/scenario-02-report-card.md)
 - [Scenario 04 Report Card](./report-cards/scenario-04-report-card.md)
 - [Scenario 05 Report Card](./report-cards/scenario-05-report-card.md)
+- [Scenario 06 Report Card](./report-cards/scenario-06-report-card.md)
 - [Scenario 08 Report Card](./report-cards/scenario-08-report-card.md)

@@ -170,6 +170,10 @@ final class MetadataLogSegmentWriter {
             throw new RewriteException("compressed metadata log batches are not supported");
         }
 
+        if (sourceBatch.isControlBatch()) {
+            return rewriteControlBatchAsNoOp(sourceBatch);
+        }
+
         ByteBuffer buffer = ByteBuffer.allocate(Math.max(sourceBatch.sizeInBytes() * 2, sourceBatch.sizeInBytes() + 256));
         MemoryRecordsBuilder builder = MemoryRecords.builder(
             buffer,
@@ -182,7 +186,7 @@ final class MetadataLogSegmentWriter {
             sourceBatch.producerEpoch(),
             sourceBatch.baseSequence(),
             sourceBatch.isTransactional(),
-            sourceBatch.isControlBatch(),
+            false,
             sourceBatch.partitionLeaderEpoch()
         );
 
@@ -191,6 +195,36 @@ final class MetadataLogSegmentWriter {
             ApiMessageAndVersion rewritten = rewriteTailRecord(original, partitionStates, survivingSet);
             ByteBuffer value = serialize(rewritten);
             builder.appendWithOffset(sourceRecord.offset(), new org.apache.kafka.common.record.SimpleRecord(sourceRecord.timestamp(), null, value));
+        }
+        return builder.build();
+    }
+
+    private MemoryRecords rewriteControlBatchAsNoOp(FileChannelRecordBatch sourceBatch) {
+        ByteBuffer buffer = ByteBuffer.allocate(Math.max(sourceBatch.sizeInBytes(), 256));
+        MemoryRecordsBuilder builder = MemoryRecords.builder(
+            buffer,
+            sourceBatch.magic(),
+            Compression.NONE,
+            timestampTypeFor(sourceBatch),
+            sourceBatch.baseOffset(),
+            sourceBatch.maxTimestamp(),
+            sourceBatch.producerId(),
+            sourceBatch.producerEpoch(),
+            sourceBatch.baseSequence(),
+            sourceBatch.isTransactional(),
+            false,
+            sourceBatch.partitionLeaderEpoch()
+        );
+
+        for (Record sourceRecord : sourceBatch) {
+            builder.appendWithOffset(
+                sourceRecord.offset(),
+                new org.apache.kafka.common.record.SimpleRecord(
+                    sourceRecord.timestamp(),
+                    null,
+                    serialize(noOp())
+                )
+            );
         }
         return builder.build();
     }
@@ -266,10 +300,7 @@ final class MetadataLogSegmentWriter {
             return new ApiMessageAndVersion(rewritten, original.version());
         }
 
-        throw new RewriteException(
-            "unsupported metadata log tail record type after checkpoint rewrite: " +
-                original.message().getClass().getSimpleName()
-        );
+        return original;
     }
 
     private PartitionTailState applyChange(PartitionTailState currentState, PartitionChangeRecord record) {
@@ -309,6 +340,10 @@ final class MetadataLogSegmentWriter {
         SERDE.write(record, cache, new ByteBufferAccessor(buffer));
         buffer.flip();
         return buffer;
+    }
+
+    private ApiMessageAndVersion noOp() {
+        return new ApiMessageAndVersion(new NoOpRecord(), (short) 0);
     }
 
     private List<Integer> filterSurviving(List<Integer> brokerIds, Set<Integer> survivingSet) {

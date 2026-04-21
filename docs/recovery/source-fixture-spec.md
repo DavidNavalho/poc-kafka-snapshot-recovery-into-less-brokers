@@ -111,8 +111,8 @@ Required top-level shape:
 ```json
 {
   "schema_version": 1,
-  "snapshot_label": "baseline-clean-v2",
-  "source_fixture_version": "baseline-clean-v2",
+  "snapshot_label": "baseline-clean-v3",
+  "source_fixture_version": "baseline-clean-v3",
   "created_at_utc": "YYYY-MM-DDTHH:MM:SSZ",
   "image": {
     "vendor": "confluentinc",
@@ -249,11 +249,14 @@ Planned labels:
 
 - `baseline-clean-v1`
 - `baseline-clean-v2`
+- `baseline-clean-v3`
 - `baseline-live-v1` for the deferred live-snapshot scenario
 
 `baseline-clean-v1` remains the original clean-stop fixture used by Scenario 01 and Scenario 02.
 
 `baseline-clean-v2` is the corrected clean-stop fixture revision for config-preservation coverage. It removes the accidental static broker retention override and records a real dynamic broker override on broker `0`.
+
+`baseline-clean-v3` is the corrected clean-stop fixture revision for compacted-topic recovery coverage. It preserves the Scenario 05 broker-config fix from `baseline-clean-v2` and adds the missing compacted-topic key prefixes so expectation files and replayed latest-value maps match.
 
 If a scenario needs materially different source data, create a new snapshot label instead of mutating an existing fixture revision.
 
