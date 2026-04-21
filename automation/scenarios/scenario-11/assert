@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+require_cmd jq
+
+scenario_id="scenario-11"
+run_id="${1:-}"
+
+[[ -n "${run_id}" ]] || fail "usage: automation/scenarios/scenario-11/assert <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+
+manifest_path="${SUITE_MANIFEST_PATH:-${WORKDIR}/artifacts/suite-manifest.json}"
+assert_dir="${WORKDIR}/artifacts/assert"
+summary_path="${assert_dir}/assert-summary.json"
+assertions_jsonl_path="${assert_dir}/assertions.jsonl"
+
+ensure_dir "${assert_dir}"
+: >"${assertions_jsonl_path}"
+
+had_failure=0
+
+record_assertion() {
+  local id="$1"
+  local name="$2"
+  local result="$3"
+  local evidence="$4"
+  local details="$5"
+
+  if [[ "${result}" != "PASS" ]]; then
+    had_failure=1
+  fi
+
+  jq -nc \
+    --arg id "${id}" \
+    --arg name "${name}" \
+    --arg result "${result}" \
+    --arg evidence "${evidence}" \
+    --arg details "${details}" \
+    '{id: $id, name: $name, result: $result, evidence: $evidence, details: $details}' >>"${assertions_jsonl_path}"
+}
+
+a1_details=()
+if [[ ! -f "${manifest_path}" ]]; then
+  a1_details+=("manifest-missing")
+else
+  requested="$(jq -r '.requested_core_scenarios | join(",")' "${manifest_path}")"
+  actual="$(jq -r '.core_scenarios | map(.scenario_id) | join(",")' "${manifest_path}")"
+  [[ "${requested}" == "${actual}" ]] || a1_details+=("requested=${requested}:actual=${actual}")
+  while IFS= read -r scenario_run_id; do
+    [[ -n "${scenario_run_id}" ]] || a1_details+=("missing-run-id")
+  done < <(jq -r '.core_scenarios[]?.run_id // empty' "${manifest_path}")
+fi
+
+if [[ "${#a1_details[@]}" -eq 0 ]]; then
+  record_assertion "A1" "Suite manifest covers the full core scenario set in the required order" "PASS" "${manifest_path}" "the suite manifest recorded the requested core scenario set in order with derived run IDs"
+else
+  record_assertion "A1" "Suite manifest covers the full core scenario set in the required order" "FAIL" "${manifest_path}" "$(printf '%s; ' "${a1_details[@]}" | sed 's/; $//')"
+fi
+
+a2_details=()
+if [[ ! -f "${manifest_path}" ]]; then
+  a2_details+=("manifest-missing")
+else
+  while IFS= read -r scenario_json; do
+    scenario_name="$(jq -r '.scenario_id' <<<"${scenario_json}")"
+    scenario_status="$(jq -r '.status' <<<"${scenario_json}")"
+    [[ "${scenario_status}" == "pass" ]] || a2_details+=("${scenario_name}:status=${scenario_status}")
+    while IFS= read -r step_json; do
+      step_name="$(jq -r '.name' <<<"${step_json}")"
+      step_status="$(jq -r '.status' <<<"${step_json}")"
+      [[ "${step_status}" == "success" ]] || a2_details+=("${scenario_name}:${step_name}=${step_status}")
+    done < <(jq -c '.steps[]?' <<<"${scenario_json}")
+  done < <(jq -c '.core_scenarios[]?' "${manifest_path}")
+fi
+
+if [[ "${#a2_details[@]}" -eq 0 ]]; then
+  record_assertion "A2" "All orchestrated scenario steps completed successfully" "PASS" "${manifest_path}" "every core scenario recorded successful prepare, rewrite, up, assert, report, and down steps"
+else
+  record_assertion "A2" "All orchestrated scenario steps completed successfully" "FAIL" "${manifest_path}" "$(printf '%s; ' "${a2_details[@]}" | sed 's/; $//')"
+fi
+
+a3_details=()
+if [[ ! -f "${manifest_path}" ]]; then
+  a3_details+=("manifest-missing")
+else
+  while IFS= read -r scenario_json; do
+    scenario_name="$(jq -r '.scenario_id' <<<"${scenario_json}")"
+    summary_file="$(jq -r '.summary_path' <<<"${scenario_json}")"
+    if [[ ! -f "${summary_file}" ]]; then
+      a3_details+=("${scenario_name}:summary-missing")
+      continue
+    fi
+    summary_status="$(jq -r '.status // "missing"' "${summary_file}")"
+    [[ "${summary_status}" == "pass" ]] || a3_details+=("${scenario_name}:summary-status=${summary_status}")
+  done < <(jq -c '.core_scenarios[]?' "${manifest_path}")
+fi
+
+if [[ "${#a3_details[@]}" -eq 0 ]]; then
+  record_assertion "A3" "All orchestrated core scenarios ended in a passing assert summary" "PASS" "${manifest_path}" "every orchestrated core scenario wrote an assert summary with status pass"
+else
+  record_assertion "A3" "All orchestrated core scenarios ended in a passing assert summary" "FAIL" "${manifest_path}" "$(printf '%s; ' "${a3_details[@]}" | sed 's/; $//')"
+fi
+
+a4_details=()
+if [[ ! -f "${manifest_path}" ]]; then
+  a4_details+=("manifest-missing")
+else
+  while IFS= read -r scenario_json; do
+    scenario_name="$(jq -r '.scenario_id' <<<"${scenario_json}")"
+    report_path="$(jq -r '.report_path' <<<"${scenario_json}")"
+    [[ -f "${report_path}" ]] || a4_details+=("${scenario_name}:report-missing")
+    while IFS= read -r step_log_path; do
+      [[ -f "${step_log_path}" ]] || a4_details+=("${scenario_name}:step-log-missing=${step_log_path}")
+    done < <(jq -r '.steps[]?.log_path // empty' <<<"${scenario_json}")
+  done < <(jq -c '.core_scenarios[]?' "${manifest_path}")
+fi
+
+if [[ "${#a4_details[@]}" -eq 0 ]]; then
+  record_assertion "A4" "The suite produced a complete report bundle automatically" "PASS" "${WORKDIR}/artifacts/steps" "all per-scenario reports and step logs exist in the suite bundle"
+else
+  record_assertion "A4" "The suite produced a complete report bundle automatically" "FAIL" "${WORKDIR}/artifacts/steps" "$(printf '%s; ' "${a4_details[@]}" | sed 's/; $//')"
+fi
+
+status="pass"
+if [[ "${had_failure}" -ne 0 ]]; then
+  status="fail"
+fi
+
+jq -n \
+  --arg scenario "${scenario_id}" \
+  --arg run_id "${run_id}" \
+  --arg snapshot_label "${SNAPSHOT_LABEL}" \
+  --arg status "${status}" \
+  --arg generated_at "$(timestamp_utc)" \
+  '{
+    scenario: $scenario,
+    run_id: $run_id,
+    snapshot_label: $snapshot_label,
+    status: $status,
+    generated_at_utc: $generated_at,
+    assertions: [inputs]
+  }' "${assertions_jsonl_path}" >"${summary_path}"
+
+log "scenario 11 assert artifacts written to ${assert_dir}"

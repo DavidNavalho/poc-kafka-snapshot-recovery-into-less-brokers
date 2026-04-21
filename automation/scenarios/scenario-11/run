@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+require_cmd jq
+
+scenario_id="scenario-11"
+snapshot_label="${1:-baseline-clean-v3}"
+run_id="${2:-$(run_id_utc)}"
+scenario_automation_root="${SCENARIO11_AUTOMATION_ROOT:-${REPO_ROOT}/automation}"
+core_scenarios_csv="${SCENARIO11_CORE_SCENARIOS:-scenario-01,scenario-02,scenario-04,scenario-05,scenario-06,scenario-07,scenario-08,scenario-10}"
+
+IFS=',' read -r -a core_scenarios <<<"${core_scenarios_csv}"
+
+suite_workdir="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}"
+steps_root="${suite_workdir}/artifacts/steps"
+assert_dir="${suite_workdir}/artifacts/assert"
+manifest_path="${suite_workdir}/artifacts/suite-manifest.json"
+results_jsonl_path="${suite_workdir}/artifacts/core-scenarios.jsonl"
+report_date="$(date -u +%F)"
+started_at="$(timestamp_utc)"
+
+[[ "${#core_scenarios[@]}" -gt 0 ]] || fail "Scenario 11 requires at least one core scenario"
+[[ ! -e "${suite_workdir}" ]] || fail "scenario run already exists: ${suite_workdir}"
+
+ensure_dir "${suite_workdir}/artifacts"
+ensure_dir "${steps_root}"
+ensure_dir "${assert_dir}"
+: >"${results_jsonl_path}"
+
+cat >"${suite_workdir}/run.env" <<EOF
+SCENARIO_ID=${scenario_id}
+RUN_ID=${run_id}
+SNAPSHOT_LABEL=${snapshot_label}
+WORKDIR=${suite_workdir}
+SUITE_MANIFEST_PATH=${manifest_path}
+EOF
+
+log_step() {
+  local scenario_name="$1"
+  local step_number="$2"
+  local step_name="$3"
+  shift 3
+
+  local step_dir="${steps_root}/${scenario_name}"
+  local log_path="${step_dir}/$(printf '%02d' "${step_number}")-${step_name}.log"
+  local status="success"
+
+  ensure_dir "${step_dir}"
+  if "$@" >"${log_path}" 2>&1; then
+    :
+  else
+    status="failure"
+  fi
+
+  SCENARIO11_LAST_LOG_PATH="${log_path}"
+  SCENARIO11_LAST_STATUS="${status}"
+  [[ "${status}" == "success" ]]
+}
+
+append_step_json() {
+  local steps_json="$1"
+  local step_name="$2"
+  local step_status="$3"
+  local step_log_path="$4"
+  jq -c \
+    --arg name "${step_name}" \
+    --arg status "${step_status}" \
+    --arg log_path "${step_log_path}" \
+    '. + [{name: $name, status: $status, log_path: $log_path}]' <<<"${steps_json}"
+}
+
+overall_status="pass"
+scenario_index=0
+
+for scenario_name in "${core_scenarios[@]}"; do
+  scenario_index=$((scenario_index + 1))
+  scenario_suffix="$(printf 's%02d' "${scenario_index}")"
+  scenario_run_id="${run_id}-${scenario_suffix}"
+  scenario_report_path="${REPORT_RUNS_ROOT}/${report_date}-${scenario_name}-${scenario_run_id}.md"
+  scenario_summary_path="${SCENARIO_RUNS_ROOT}/${scenario_name}/${scenario_run_id}/artifacts/assert/assert-summary.json"
+  scenario_workdir="${SCENARIO_RUNS_ROOT}/${scenario_name}/${scenario_run_id}"
+  scenario_status="pass"
+  steps_json='[]'
+  recovery_started=0
+
+  if ! log_step "${scenario_name}" 1 prepare env REPO_ROOT="${REPO_ROOT}" SNAPSHOTS_ROOT="${SNAPSHOTS_ROOT}" "${scenario_automation_root}/recovery/prepare" "${scenario_name}" "${snapshot_label}" "${scenario_run_id}"; then
+    scenario_status="fail"
+    overall_status="fail"
+  fi
+  steps_json="$(append_step_json "${steps_json}" "prepare" "${SCENARIO11_LAST_STATUS}" "${SCENARIO11_LAST_LOG_PATH}")"
+
+  if [[ "${scenario_status}" == "pass" ]]; then
+    if ! log_step "${scenario_name}" 2 rewrite env REPO_ROOT="${REPO_ROOT}" SNAPSHOTS_ROOT="${SNAPSHOTS_ROOT}" "${scenario_automation_root}/recovery/rewrite" "${scenario_name}" "${scenario_run_id}"; then
+      scenario_status="fail"
+      overall_status="fail"
+    fi
+    steps_json="$(append_step_json "${steps_json}" "rewrite" "${SCENARIO11_LAST_STATUS}" "${SCENARIO11_LAST_LOG_PATH}")"
+  fi
+
+  if [[ "${scenario_status}" == "pass" ]]; then
+    if ! log_step "${scenario_name}" 3 up env REPO_ROOT="${REPO_ROOT}" SNAPSHOTS_ROOT="${SNAPSHOTS_ROOT}" "${scenario_automation_root}/recovery/up" "${scenario_name}" "${scenario_run_id}"; then
+      scenario_status="fail"
+      overall_status="fail"
+    else
+      recovery_started=1
+    fi
+    steps_json="$(append_step_json "${steps_json}" "up" "${SCENARIO11_LAST_STATUS}" "${SCENARIO11_LAST_LOG_PATH}")"
+  fi
+
+  if [[ "${scenario_status}" == "pass" ]]; then
+    if ! log_step "${scenario_name}" 4 assert env REPO_ROOT="${REPO_ROOT}" "${scenario_automation_root}/scenarios/${scenario_name}/assert" "${scenario_run_id}"; then
+      scenario_status="fail"
+      overall_status="fail"
+    fi
+    steps_json="$(append_step_json "${steps_json}" "assert" "${SCENARIO11_LAST_STATUS}" "${SCENARIO11_LAST_LOG_PATH}")"
+  fi
+
+  if [[ "${scenario_status}" == "pass" ]]; then
+    if ! log_step "${scenario_name}" 5 report env REPO_ROOT="${REPO_ROOT}" "${scenario_automation_root}/scenarios/${scenario_name}/report" "${scenario_run_id}"; then
+      scenario_status="fail"
+      overall_status="fail"
+    fi
+    steps_json="$(append_step_json "${steps_json}" "report" "${SCENARIO11_LAST_STATUS}" "${SCENARIO11_LAST_LOG_PATH}")"
+  fi
+
+  if [[ "${recovery_started}" -eq 1 ]]; then
+    if ! log_step "${scenario_name}" 6 down env REPO_ROOT="${REPO_ROOT}" SNAPSHOTS_ROOT="${SNAPSHOTS_ROOT}" "${scenario_automation_root}/recovery/down" "${scenario_name}" "${scenario_run_id}"; then
+      scenario_status="fail"
+      overall_status="fail"
+    fi
+    steps_json="$(append_step_json "${steps_json}" "down" "${SCENARIO11_LAST_STATUS}" "${SCENARIO11_LAST_LOG_PATH}")"
+  fi
+
+  jq -nc \
+    --arg scenario_name "${scenario_name}" \
+    --arg scenario_run_id "${scenario_run_id}" \
+    --arg scenario_status "${scenario_status}" \
+    --arg summary_path "${scenario_summary_path}" \
+    --arg report_path "${scenario_report_path}" \
+    --arg workdir "${scenario_workdir}" \
+    --argjson steps "${steps_json}" \
+    '{
+      scenario_id: $scenario_name,
+      run_id: $scenario_run_id,
+      status: $scenario_status,
+      summary_path: $summary_path,
+      report_path: $report_path,
+      workdir: $workdir,
+      steps: $steps
+    }' >>"${results_jsonl_path}"
+
+  if [[ "${scenario_status}" != "pass" ]]; then
+    break
+  fi
+done
+
+completed_at="$(timestamp_utc)"
+jq -n \
+  --arg scenario "${scenario_id}" \
+  --arg run_id "${run_id}" \
+  --arg snapshot_label "${snapshot_label}" \
+  --arg status "${overall_status}" \
+  --arg started_at "${started_at}" \
+  --arg completed_at "${completed_at}" \
+  --arg suite_workdir "${suite_workdir}" \
+  --arg steps_root "${steps_root}" \
+  --argjson requested_core_scenarios "$(jq -cn --arg csv "${core_scenarios_csv}" '$csv | split(",")')" \
+  '{
+    scenario: $scenario,
+    run_id: $run_id,
+    snapshot_label: $snapshot_label,
+    status: $status,
+    started_at_utc: $started_at,
+    completed_at_utc: $completed_at,
+    suite_workdir: $suite_workdir,
+    steps_root: $steps_root,
+    requested_core_scenarios: $requested_core_scenarios,
+    core_scenarios: [inputs]
+  }' "${results_jsonl_path}" >"${manifest_path}"
+
+"${REPO_ROOT}/automation/scenarios/scenario-11/assert" "${run_id}"
+"${REPO_ROOT}/automation/scenarios/scenario-11/report" "${run_id}"
+
+summary_status="$(jq -r '.status // "fail"' "${assert_dir}/assert-summary.json")"
+if [[ "${summary_status}" != "pass" ]]; then
+  fail "Scenario 11 suite failed; see ${manifest_path}"
+fi
+
+log "scenario 11 suite completed successfully"

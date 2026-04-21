@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+require_cmd docker
+require_cmd jq
+
+scenario_id="scenario-11"
+run_id="${1:-}"
+
+[[ -n "${run_id}" ]] || fail "usage: automation/scenarios/scenario-11/report <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+
+manifest_path="${SUITE_MANIFEST_PATH:-${WORKDIR}/artifacts/suite-manifest.json}"
+summary_path="${WORKDIR}/artifacts/assert/assert-summary.json"
+report_date="$(date -u +%F)"
+report_path="${REPORT_RUNS_ROOT}/${report_date}-scenario-11-${run_id}.md"
+summary_status="$(jq -r '.status // "fail"' "${summary_path}")"
+docker_server_version="$(docker version --format '{{.Server.Version}}' 2>/dev/null || printf 'unknown')"
+docker_compose_version="$(docker compose version --short 2>/dev/null || printf 'unknown')"
+host_machine="$(hostname)"
+
+case "${summary_status}" in
+  pass) result_label="PASS" ;;
+  fail) result_label="FAIL" ;;
+  *) result_label="PARTIAL" ;;
+esac
+
+assertions_table="$(
+  jq -r '.assertions[] | [.name, .result, .evidence] | @tsv' "${summary_path}" | while IFS=$'\t' read -r name result evidence; do
+    printf '| %s | %s | `%s` |\n' "${name}" "${result}" "${evidence}"
+  done
+)"
+
+scenario_table="$(
+  jq -r '.core_scenarios[] | [.scenario_id, .run_id, .status, .summary_path, .report_path] | @tsv' "${manifest_path}" | while IFS=$'\t' read -r scenario_name scenario_run_id scenario_status summary_file report_file; do
+    printf '| %s | %s | %s | `%s` | `%s` |\n' "${scenario_name}" "${scenario_run_id}" "${scenario_status}" "${summary_file}" "${report_file}"
+  done
+)"
+
+findings_block="- none"
+if [[ "${summary_status}" != "pass" ]]; then
+  findings_block="$(
+    jq -r '.assertions[] | select(.result != "PASS") | "- " + .name + ": " + (.details // "no details")' "${summary_path}"
+  )"
+fi
+
+follow_up_block="- Investigate the failing suite manifest, step logs, or per-scenario outputs before continuing."
+if [[ "${summary_status}" == "pass" ]]; then
+  follow_up_block="- Proceed to Scenario 12."
+fi
+
+ensure_dir "${REPORT_RUNS_ROOT}"
+
+cat >"${report_path}" <<EOF
+# Scenario 11 Report
+
+## Summary
+
+- Scenario: scenario-11
+- Run ID: ${run_id}
+- Date: ${report_date}
+- Snapshot label: ${SNAPSHOT_LABEL}
+- Result: ${result_label}
+
+## Environment
+
+- Host machine: ${host_machine}
+- Docker version: ${docker_server_version}
+- Compose version: ${docker_compose_version}
+- Relevant resource notes: suite report generated from ${WORKDIR}
+
+## Procedure
+
+1. \`automation/scenarios/scenario-11/run ${SNAPSHOT_LABEL} ${run_id}\`
+2. per-scenario steps persisted under \`${WORKDIR}/artifacts/steps/\`
+3. suite manifest written to \`${manifest_path}\`
+4. \`automation/scenarios/scenario-11/assert ${run_id}\`
+5. \`automation/scenarios/scenario-11/report ${run_id}\`
+
+## Assertions
+
+| Assertion | Result | Evidence |
+|---|---|---|
+${assertions_table}
+
+## Core Scenario Results
+
+| Scenario | Run ID | Status | Summary | Report |
+|---|---|---|---|---|
+${scenario_table}
+
+## Artifacts
+
+- Suite manifest: \`${manifest_path}\`
+- Step log root: \`${WORKDIR}/artifacts/steps/\`
+- Suite assert summary: \`${summary_path}\`
+
+## Findings
+
+${findings_block}
+
+## Follow-Up
+
+${follow_up_block}
+EOF
+
+log "scenario 11 report written to ${report_path}"

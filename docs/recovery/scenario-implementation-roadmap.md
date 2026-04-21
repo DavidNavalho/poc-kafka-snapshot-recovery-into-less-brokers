@@ -24,6 +24,7 @@ This file is the current planning authority for:
 - Scenario 08 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T131900Z`.
 - Scenario 03 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T154928Z`.
 - Scenario 10 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T162030Z`.
+- Scenario 11 is now fully automated and has passed `run` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T163100Z`.
 - Two important runtime issues were already found and fixed:
   - source and recovery clusters must not share the same Docker network namespace
   - copied metadata snapshot directories must be cleaned more aggressively before installing rewritten state
@@ -356,7 +357,9 @@ Done gate:
 
 Current status:
 
-- not ready until the scenario-specific checks above exist
+- implemented and validated from a fresh worktree
+- latest clean report: `docs/recovery/reports/runs/2026-04-21-scenario-11-20260421T163100Z.md`
+- the suite manifest, per-step logs, and per-scenario report bundle are now automated
 
 Spec before implementation:
 
@@ -373,13 +376,13 @@ Likely implementation focus:
 
 Done gate:
 
-- one command runs the clean-stop flow from snapshot to report bundle without manual intervention
+- achieved on 2026-04-21 by run `20260421T163100Z`
 
 ### Scenario 12: Repeatability
 
 Current status:
 
-- not ready until Scenario 11 or an equivalent automated flow exists
+- ready now that Scenario 11 is green
 
 Spec before implementation:
 
