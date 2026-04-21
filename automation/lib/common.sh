@@ -3,13 +3,13 @@
 set -euo pipefail
 
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-readonly FIXTURES_ROOT="${REPO_ROOT}/fixtures"
-readonly DOCS_ROOT="${REPO_ROOT}/docs/recovery"
-readonly SOURCE_LIVE_ROOT="${FIXTURES_ROOT}/source-cluster/live"
-readonly SOURCE_ARTIFACTS_ROOT="${FIXTURES_ROOT}/source-cluster/artifacts"
-readonly SNAPSHOTS_ROOT="${FIXTURES_ROOT}/snapshots"
-readonly SCENARIO_RUNS_ROOT="${FIXTURES_ROOT}/scenario-runs"
-readonly REPORT_RUNS_ROOT="${DOCS_ROOT}/reports/runs"
+readonly FIXTURES_ROOT="${FIXTURES_ROOT:-${REPO_ROOT}/fixtures}"
+readonly DOCS_ROOT="${DOCS_ROOT:-${REPO_ROOT}/docs/recovery}"
+readonly SOURCE_LIVE_ROOT="${SOURCE_LIVE_ROOT:-${FIXTURES_ROOT}/source-cluster/live}"
+readonly SOURCE_ARTIFACTS_ROOT="${SOURCE_ARTIFACTS_ROOT:-${FIXTURES_ROOT}/source-cluster/artifacts}"
+readonly SNAPSHOTS_ROOT="${SNAPSHOTS_ROOT:-${FIXTURES_ROOT}/snapshots}"
+readonly SCENARIO_RUNS_ROOT="${SCENARIO_RUNS_ROOT:-${FIXTURES_ROOT}/scenario-runs}"
+readonly REPORT_RUNS_ROOT="${REPORT_RUNS_ROOT:-${DOCS_ROOT}/reports/runs}"
 readonly METADATA_SNAPSHOT_SUBDIR="__cluster_metadata-0"
 
 readonly KAFKA_IMAGE="${KAFKA_IMAGE:-confluentinc/cp-kafka:8.1.0}"

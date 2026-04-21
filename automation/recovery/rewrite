@@ -14,6 +14,9 @@ run_id="${2:-}"
 run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
 load_run_env "${run_env_path}"
 
+snapshot_source_root="${SNAPSHOT_SOURCE_ROOT:-${SNAPSHOTS_ROOT}}"
+source_metadata_log_path="${SOURCE_METADATA_LOG_PATH:-}"
+
 selected_checkpoint_path="$(jq -r '.path' "${SELECTED_CHECKPOINT_JSON}")"
 selected_checkpoint_basename="$(jq -r '.basename' "${SELECTED_CHECKPOINT_JSON}")"
 dynamic_quorum="$(jq -r '.dynamic_quorum' "${QUORUM_STATE_JSON}")"
@@ -24,7 +27,6 @@ rewritten_metadata_timeindex_path="${WORKDIR}/artifacts/rewrite/0000000000000000
 rewrite_report_path="${WORKDIR}/artifacts/rewrite/rewrite-report.json"
 expected_command_path="${WORKDIR}/artifacts/rewrite/rewrite-command.txt"
 tool_path="${SNAPSHOT_REWRITE_TOOL:-${REPO_ROOT}/bin/snapshot-rewrite-tool}"
-source_metadata_log_path=""
 
 if [[ "${dynamic_quorum}" == "true" ]]; then
   rewrite_voters_flag="--rewrite-voters"
@@ -39,17 +41,21 @@ write_static_quorum_state() {
 EOF
 }
 
-for broker_id in 0 1 2; do
-  candidate_metadata_log_path="${SNAPSHOTS_ROOT}/${SNAPSHOT_LABEL}/brokers/broker-${broker_id}/metadata/__cluster_metadata-0/00000000000000000000.log"
-  [[ -f "${candidate_metadata_log_path}" ]] || fail "source metadata log not found for broker ${broker_id}: ${candidate_metadata_log_path}"
-  if [[ -z "${source_metadata_log_path}" ]]; then
-    source_metadata_log_path="${candidate_metadata_log_path}"
-    continue
-  fi
-  if ! cmp -s "${source_metadata_log_path}" "${candidate_metadata_log_path}"; then
-    fail "surviving source metadata logs differ between brokers; per-broker metadata log rewrite is not implemented"
-  fi
-done
+if [[ -n "${source_metadata_log_path}" ]]; then
+  [[ -f "${source_metadata_log_path}" ]] || fail "prepared source metadata log not found: ${source_metadata_log_path}"
+else
+  for broker_id in 0 1 2; do
+    candidate_metadata_log_path="${snapshot_source_root}/${SNAPSHOT_LABEL}/brokers/broker-${broker_id}/metadata/__cluster_metadata-0/00000000000000000000.log"
+    [[ -f "${candidate_metadata_log_path}" ]] || fail "source metadata log not found for broker ${broker_id}: ${candidate_metadata_log_path}"
+    if [[ -z "${source_metadata_log_path}" ]]; then
+      source_metadata_log_path="${candidate_metadata_log_path}"
+      continue
+    fi
+    if ! cmp -s "${source_metadata_log_path}" "${candidate_metadata_log_path}"; then
+      fail "surviving source metadata logs differ between brokers; per-broker metadata log rewrite is not implemented"
+    fi
+  done
+fi
 
 {
   printf '%q ' "${tool_path}" \
@@ -85,13 +91,21 @@ fi
 
 for broker_id in 0 1 2; do
   metadata_dir="$(metadata_snapshot_dir "${WORKDIR}/brokers/broker-${broker_id}/metadata")"
-  source_leader_epoch_checkpoint_path="${SNAPSHOTS_ROOT}/${SNAPSHOT_LABEL}/brokers/broker-${broker_id}/metadata/${METADATA_SNAPSHOT_SUBDIR}/leader-epoch-checkpoint"
+  prepared_leader_epoch_checkpoint_path="${WORKDIR}/artifacts/rewrite/broker-${broker_id}.leader-epoch-checkpoint"
+  source_leader_epoch_checkpoint_path="${metadata_dir}/leader-epoch-checkpoint"
+  if [[ -f "${source_leader_epoch_checkpoint_path}" ]]; then
+    cp "${source_leader_epoch_checkpoint_path}" "${prepared_leader_epoch_checkpoint_path}"
+  else
+    source_leader_epoch_checkpoint_path="${snapshot_source_root}/${SNAPSHOT_LABEL}/brokers/broker-${broker_id}/metadata/${METADATA_SNAPSHOT_SUBDIR}/leader-epoch-checkpoint"
+    [[ -f "${source_leader_epoch_checkpoint_path}" ]] || fail "source leader-epoch checkpoint not found for broker ${broker_id}: ${source_leader_epoch_checkpoint_path}"
+    cp "${source_leader_epoch_checkpoint_path}" "${prepared_leader_epoch_checkpoint_path}"
+  fi
   reset_metadata_snapshot_dir "${metadata_dir}"
   cp "${rewritten_checkpoint_path}" "${metadata_dir}/${selected_checkpoint_basename}"
   cp "${rewritten_metadata_log_path}" "${metadata_dir}/00000000000000000000.log"
   cp "${rewritten_metadata_index_path}" "${metadata_dir}/00000000000000000000.index"
   cp "${rewritten_metadata_timeindex_path}" "${metadata_dir}/00000000000000000000.timeindex"
-  cp "${source_leader_epoch_checkpoint_path}" "${metadata_dir}/leader-epoch-checkpoint"
+  cp "${prepared_leader_epoch_checkpoint_path}" "${metadata_dir}/leader-epoch-checkpoint"
   if [[ "${dynamic_quorum}" == "true" ]]; then
     fail "dynamic quorum quorum-state rewrite is not implemented"
   fi

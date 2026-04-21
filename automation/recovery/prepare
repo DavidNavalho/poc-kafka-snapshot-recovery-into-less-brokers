@@ -16,6 +16,7 @@ run_id="${3:-$(run_id_utc)}"
 snapshot_dir="${SNAPSHOTS_ROOT}/${snapshot_label}"
 workdir="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}"
 project_name="$(sanitize_project_name "${scenario_id}-${run_id}")"
+source_metadata_log_artifact="${workdir}/artifacts/prepare/source-metadata.log"
 
 [[ -d "${snapshot_dir}" ]] || fail "snapshot label not found: ${snapshot_label}"
 [[ ! -e "${workdir}" ]] || fail "scenario run already exists: ${workdir}"
@@ -30,6 +31,21 @@ for broker_id in 0 1 2; do
   copy_tree "${snapshot_dir}/brokers/broker-${broker_id}" "${workdir}/brokers/broker-${broker_id}"
   ensure_dir "${workdir}/brokers/broker-${broker_id}/data-root"
 done
+
+source_metadata_log_path=""
+for broker_id in 0 1 2; do
+  candidate_metadata_log_path="$(metadata_snapshot_dir "${workdir}/brokers/broker-${broker_id}/metadata")/00000000000000000000.log"
+  [[ -f "${candidate_metadata_log_path}" ]] || fail "copied source metadata log missing for broker ${broker_id}: ${candidate_metadata_log_path}"
+  if [[ -z "${source_metadata_log_path}" ]]; then
+    source_metadata_log_path="${candidate_metadata_log_path}"
+    continue
+  fi
+  if ! cmp -s "${source_metadata_log_path}" "${candidate_metadata_log_path}"; then
+    fail "surviving source metadata logs differ between copied brokers; per-broker metadata log rewrite is not implemented"
+  fi
+done
+
+cp "${source_metadata_log_path}" "${source_metadata_log_artifact}"
 
 quorum_state_json "$(metadata_snapshot_dir "${workdir}/brokers/broker-0/metadata")/quorum-state" >"${workdir}/artifacts/prepare/quorum-state.json"
 checkpoint_json_for_root "${workdir}/brokers" >"${workdir}/artifacts/prepare/selected-checkpoint.json"
@@ -53,6 +69,8 @@ cat >"${workdir}/run.env" <<EOF
 SCENARIO_ID=${scenario_id}
 RUN_ID=${run_id}
 SNAPSHOT_LABEL=${snapshot_label}
+SNAPSHOT_SOURCE_ROOT=${SNAPSHOTS_ROOT}
+SOURCE_METADATA_LOG_PATH=${source_metadata_log_artifact}
 WORKDIR=${workdir}
 RECOVERY_PROJECT=${project_name}
 RECOVERY_WORKDIR=${workdir}

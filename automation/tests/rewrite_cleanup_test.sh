@@ -9,10 +9,11 @@ scenario_id="test-rewrite-cleanup"
 run_id="run-$(date +%s)"
 workdir="${repo_root}/fixtures/scenario-runs/${scenario_id}/${run_id}"
 snapshot_label="${scenario_id}-${run_id}"
-snapshot_root="${repo_root}/fixtures/snapshots/${snapshot_label}"
+snapshot_parent="$(mktemp -d)"
+source_metadata_log_path="${workdir}/artifacts/prepare/source-metadata.log"
 
 cleanup() {
-  rm -rf "${repo_root}/fixtures/scenario-runs/${scenario_id}" "${snapshot_root}"
+  rm -rf "${repo_root}/fixtures/scenario-runs/${scenario_id}" "${snapshot_parent}"
 }
 trap cleanup EXIT
 
@@ -36,6 +37,8 @@ cat >"${quorum_state_json}" <<EOF
   "dynamic_quorum": false
 }
 EOF
+
+printf 'shared-source-log\n' >"${source_metadata_log_path}"
 
 cat >"${stub_tool}" <<'EOF'
 #!/usr/bin/env bash
@@ -87,12 +90,9 @@ reset_metadata_snapshot_dir "${metadata_cleanup_dir}"
 [[ ! -e "${metadata_cleanup_dir}/00000000000000000000.index" ]]
 
 for broker_id in 0 1 2; do
-  snapshot_metadata_dir="${snapshot_root}/brokers/broker-${broker_id}/metadata/__cluster_metadata-0"
   recovery_metadata_dir="${workdir}/brokers/broker-${broker_id}/metadata/__cluster_metadata-0"
 
-  mkdir -p "${snapshot_metadata_dir}" "${recovery_metadata_dir}"
-  printf 'shared-source-log\n' >"${snapshot_metadata_dir}/00000000000000000000.log"
-  printf 'source-leader-epoch\n' >"${snapshot_metadata_dir}/leader-epoch-checkpoint"
+  mkdir -p "${recovery_metadata_dir}"
 
   printf 'keep-me\n' >"${recovery_metadata_dir}/partition.metadata"
   printf 'stale-epoch-cache\n' >"${recovery_metadata_dir}/leader-epoch-checkpoint"
@@ -103,6 +103,8 @@ done
 cat >"${workdir}/run.env" <<EOF
 WORKDIR=${workdir}
 SNAPSHOT_LABEL=${snapshot_label}
+SNAPSHOT_SOURCE_ROOT=${snapshot_parent}
+SOURCE_METADATA_LOG_PATH=${source_metadata_log_path}
 SELECTED_CHECKPOINT_JSON=${selected_checkpoint_json}
 QUORUM_STATE_JSON=${quorum_state_json}
 SURVIVING_BROKERS=0,1,2
@@ -117,7 +119,7 @@ for broker_id in 0 1 2; do
   recovery_metadata_dir="${workdir}/brokers/broker-${broker_id}/metadata/__cluster_metadata-0"
 
   [[ -f "${recovery_metadata_dir}/partition.metadata" ]]
-  [[ "$(cat "${recovery_metadata_dir}/leader-epoch-checkpoint")" == "source-leader-epoch" ]]
+  [[ "$(cat "${recovery_metadata_dir}/leader-epoch-checkpoint")" == "stale-epoch-cache" ]]
   [[ -f "${recovery_metadata_dir}/quorum-state" ]]
   grep -q '"leaderId":-1' "${recovery_metadata_dir}/quorum-state"
   grep -q '"currentVoters":\[{"voterId":0},{"voterId":1},{"voterId":2}\]' "${recovery_metadata_dir}/quorum-state"

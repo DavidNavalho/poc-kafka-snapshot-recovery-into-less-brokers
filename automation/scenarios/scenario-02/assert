@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "$0")/../../.." && pwd -P)/automation/lib/common.sh"
+
+require_cmd docker
+require_cmd jq
+require_cmd rg
+
+scenario_id="scenario-02"
+run_id="${1:-}"
+
+[[ -n "${run_id}" ]] || fail "usage: automation/scenarios/scenario-02/assert <run-id>"
+
+run_env_path="${SCENARIO_RUNS_ROOT}/${scenario_id}/${run_id}/run.env"
+load_run_env "${run_env_path}"
+export RECOVERY_WORKDIR="${WORKDIR}"
+
+assert_dir="${WORKDIR}/artifacts/assert"
+topic_artifact_dir="${assert_dir}/topics"
+offset_artifact_dir="${assert_dir}/offsets"
+sample_artifact_dir="${assert_dir}/samples"
+recovery_artifact_dir="${WORKDIR}/artifacts/recovery"
+recovery_log_path="${recovery_artifact_dir}/docker-compose.log"
+recovery_ps_path="${assert_dir}/recovery-ps.txt"
+corruption_scan_path="${assert_dir}/corruption-scan.txt"
+assertions_jsonl_path="${assert_dir}/assertions.jsonl"
+summary_path="${assert_dir}/assert-summary.json"
+snapshot_manifest_path="${WORKDIR}/snapshot-manifest.json"
+
+ensure_dir "${assert_dir}"
+ensure_dir "${topic_artifact_dir}"
+ensure_dir "${offset_artifact_dir}"
+ensure_dir "${sample_artifact_dir}"
+ensure_dir "${recovery_artifact_dir}"
+: >"${assertions_jsonl_path}"
+
+readonly REPRESENTATIVE_TOPICS=(
+  "recovery.default.6p"
+  "recovery.default.12p"
+  "recovery.default.24p"
+  "recovery.compressed.zstd"
+)
+
+had_failure=0
+
+record_assertion() {
+  local id="$1"
+  local name="$2"
+  local result="$3"
+  local evidence="$4"
+  local details="$5"
+
+  if [[ "${result}" != "PASS" ]]; then
+    had_failure=1
+  fi
+
+  jq -nc \
+    --arg id "${id}" \
+    --arg name "${name}" \
+    --arg result "${result}" \
+    --arg evidence "${evidence}" \
+    --arg details "${details}" \
+    '{id: $id, name: $name, result: $result, evidence: $evidence, details: $details}' >>"${assertions_jsonl_path}"
+}
+
+write_scan_output() {
+  local source_path="$1"
+  local pattern="$2"
+  local output_path="$3"
+  local empty_message="$4"
+
+  if [[ ! -f "${source_path}" ]]; then
+    printf 'source file missing: %s\n' "${source_path}" >"${output_path}"
+    return 2
+  fi
+
+  if rg -ni --no-heading --color never "${pattern}" "${source_path}" >"${output_path}"; then
+    return 0
+  fi
+
+  printf '%s\n' "${empty_message}" >"${output_path}"
+  return 1
+}
+
+capture_recovery_state() {
+  recovery_compose "${RECOVERY_PROJECT}" logs --no-color >"${recovery_log_path}" || true
+  recovery_compose "${RECOVERY_PROJECT}" ps >"${recovery_ps_path}" || true
+}
+
+manifest_topic_json() {
+  local topic_name="$1"
+  jq -cer --arg topic "${topic_name}" '.topics[] | select(.name == $topic)' "${snapshot_manifest_path}"
+}
+
+expected_partition_count() {
+  local topic_name="$1"
+  manifest_topic_json "${topic_name}" | jq -r '.partitions'
+}
+
+expected_latest_offset() {
+  local topic_name="$1"
+  local partition_id="$2"
+  manifest_topic_json "${topic_name}" | jq -r --arg partition "${partition_id}" '.expected_latest_offsets[$partition] // empty'
+}
+
+sample_partitions_for_topic() {
+  local topic_name="$1"
+  case "${topic_name}" in
+    recovery.default.6p) printf '0\n5\n' ;;
+    recovery.default.12p) printf '0\n11\n' ;;
+    recovery.default.24p) printf '0\n23\n' ;;
+    recovery.compressed.zstd) printf '0\n11\n' ;;
+    *) fail "unsupported representative topic for sample partitions: ${topic_name}" ;;
+  esac
+}
+
+recovery_topic_offsets() {
+  local topic_name="$1"
+  recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 bash -lc "
+    if command -v kafka-get-offsets >/dev/null 2>&1; then
+      kafka-get-offsets --bootstrap-server kafka-0:9092 --topic '${topic_name}'
+    elif command -v kafka-get-offsets.sh >/dev/null 2>&1; then
+      kafka-get-offsets.sh --bootstrap-server kafka-0:9092 --topic '${topic_name}'
+    else
+      kafka-run-class kafka.tools.GetOffsetShell --bootstrap-server kafka-0:9092 --topic '${topic_name}'
+    fi
+  " </dev/null
+}
+
+consume_partition_count() {
+  local topic_name="$1"
+  local partition_id="$2"
+  recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 bash -lc "
+    kafka-console-consumer \
+      --bootstrap-server kafka-0:9092 \
+      --topic '${topic_name}' \
+      --partition ${partition_id} \
+      --from-beginning \
+      --timeout-ms 20000 2>/dev/null | wc -l
+  " </dev/null | tr -d '[:space:]'
+}
+
+consume_partition_preview() {
+  local topic_name="$1"
+  local partition_id="$2"
+  recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 bash -lc "
+    kafka-console-consumer \
+      --bootstrap-server kafka-0:9092 \
+      --topic '${topic_name}' \
+      --partition ${partition_id} \
+      --from-beginning \
+      --max-messages 5 \
+      --timeout-ms 20000 2>/dev/null
+  " </dev/null
+}
+
+capture_recovery_state
+
+a1_details=()
+for topic_name in "${REPRESENTATIVE_TOPICS[@]}"; do
+  if ! manifest_topic_json "${topic_name}" >/dev/null 2>&1; then
+    a1_details+=("${topic_name}:missing-from-manifest")
+    continue
+  fi
+
+  partition_count="$(expected_partition_count "${topic_name}")"
+  describe_path="${topic_artifact_dir}/${topic_name}.describe.txt"
+  unavailable_path="${topic_artifact_dir}/${topic_name}.unavailable.txt"
+
+  if ! recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 \
+    kafka-topics --bootstrap-server kafka-0:9092 --describe --topic "${topic_name}" </dev/null >"${describe_path}"; then
+    a1_details+=("${topic_name}:describe-command-failed")
+    continue
+  fi
+
+  if ! recovery_compose "${RECOVERY_PROJECT}" exec -T kafka-0 \
+    kafka-topics --bootstrap-server kafka-0:9092 --describe --topic "${topic_name}" --unavailable-partitions </dev/null >"${unavailable_path}"; then
+    a1_details+=("${topic_name}:unavailable-command-failed")
+    continue
+  fi
+
+  grep -q "Topic: ${topic_name}" "${describe_path}" || a1_details+=("${topic_name}:missing-topic")
+  actual_partition_count="$(grep -c 'Partition:' "${describe_path}" || true)"
+  [[ "${actual_partition_count}" == "${partition_count}" ]] || a1_details+=("${topic_name}:partition-count=${actual_partition_count}")
+
+  if [[ -n "$(tr -d '[:space:]' <"${unavailable_path}")" ]]; then
+    a1_details+=("${topic_name}:has-unavailable-partitions")
+  fi
+done
+
+if [[ "${#a1_details[@]}" -eq 0 ]]; then
+  record_assertion "A1" "Representative topics exist and are fully available" "PASS" "${topic_artifact_dir}" "all representative topics described successfully and reported no unavailable partitions"
+else
+  record_assertion "A1" "Representative topics exist and are fully available" "FAIL" "${topic_artifact_dir}" "$(printf '%s; ' "${a1_details[@]}" | sed 's/; $//')"
+fi
+
+a2_details=()
+for topic_name in "${REPRESENTATIVE_TOPICS[@]}"; do
+  if ! manifest_topic_json "${topic_name}" >/dev/null 2>&1; then
+    continue
+  fi
+
+  offset_path="${offset_artifact_dir}/${topic_name}.offsets.txt"
+  if ! recovery_topic_offsets "${topic_name}" >"${offset_path}"; then
+    a2_details+=("${topic_name}:offset-command-failed")
+    continue
+  fi
+
+  expected_count="$(expected_partition_count "${topic_name}")"
+  actual_count="$(grep -c "^${topic_name}:" "${offset_path}" || true)"
+  [[ "${actual_count}" == "${expected_count}" ]] || a2_details+=("${topic_name}:partition-count=${actual_count}")
+
+  while IFS=: read -r actual_topic partition_id actual_offset; do
+    [[ "${actual_topic}" == "${topic_name}" ]] || a2_details+=("${topic_name}:unexpected-topic=${actual_topic}")
+    expected_offset="$(expected_latest_offset "${topic_name}" "${partition_id}")"
+    if [[ -z "${expected_offset}" ]]; then
+      a2_details+=("${topic_name}:unexpected-partition=${partition_id}")
+      continue
+    fi
+    [[ "${actual_offset}" == "${expected_offset}" ]] || a2_details+=("${topic_name}:${partition_id}=${actual_offset}")
+  done <"${offset_path}"
+
+  while IFS=$'\t' read -r partition_id expected_offset; do
+    grep -qx "${topic_name}:${partition_id}:${expected_offset}" "${offset_path}" || a2_details+=("${topic_name}:missing-${partition_id}")
+  done < <(manifest_topic_json "${topic_name}" | jq -r '.expected_latest_offsets | to_entries[] | [.key, (.value | tostring)] | @tsv')
+done
+
+if [[ "${#a2_details[@]}" -eq 0 ]]; then
+  record_assertion "A2" "Latest offsets match the manifest exactly" "PASS" "${offset_artifact_dir}" "recovered latest offsets matched the manifest for every representative topic partition"
+else
+  record_assertion "A2" "Latest offsets match the manifest exactly" "FAIL" "${offset_artifact_dir}" "$(printf '%s; ' "${a2_details[@]}" | sed 's/; $//')"
+fi
+
+a3_details=()
+for topic_name in "${REPRESENTATIVE_TOPICS[@]}"; do
+  if ! manifest_topic_json "${topic_name}" >/dev/null 2>&1; then
+    continue
+  fi
+
+  while IFS= read -r partition_id; do
+    count_path="${sample_artifact_dir}/${topic_name}.p${partition_id}.count.txt"
+    actual_count="$(consume_partition_count "${topic_name}" "${partition_id}")"
+    printf '%s\n' "${actual_count}" >"${count_path}"
+    expected_count="$(expected_latest_offset "${topic_name}" "${partition_id}")"
+    [[ "${actual_count}" == "${expected_count}" ]] || a3_details+=("${topic_name}:p${partition_id}=${actual_count}")
+  done < <(sample_partitions_for_topic "${topic_name}")
+done
+
+if [[ "${#a3_details[@]}" -eq 0 ]]; then
+  record_assertion "A3" "Sampled partitions are fully readable from the beginning" "PASS" "${sample_artifact_dir}" "sampled partitions consumed from beginning to end and matched manifest offsets"
+else
+  record_assertion "A3" "Sampled partitions are fully readable from the beginning" "FAIL" "${sample_artifact_dir}" "$(printf '%s; ' "${a3_details[@]}" | sed 's/; $//')"
+fi
+
+a4_details=()
+for topic_name in "${REPRESENTATIVE_TOPICS[@]}"; do
+  if ! manifest_topic_json "${topic_name}" >/dev/null 2>&1; then
+    continue
+  fi
+
+  while IFS= read -r partition_id; do
+    preview_path="${sample_artifact_dir}/${topic_name}.p${partition_id}.preview.txt"
+    consume_partition_preview "${topic_name}" "${partition_id}" >"${preview_path}"
+
+    line_count="$(wc -l <"${preview_path}" | tr -d '[:space:]')"
+    [[ "${line_count}" -ge 5 ]] || a4_details+=("${topic_name}:p${partition_id}:line-count=${line_count}")
+
+    for message_index in 0 1 2 3 4; do
+      preview_line="$(sed -n "$((message_index + 1))p" "${preview_path}")"
+      expected_prefix="${topic_name}|p${partition_id}|m$(printf '%06d' "${message_index}")|"
+      [[ "${preview_line}" == "${expected_prefix}"* ]] || a4_details+=("${topic_name}:p${partition_id}:m$(printf '%06d' "${message_index}")")
+    done
+  done < <(sample_partitions_for_topic "${topic_name}")
+done
+
+if [[ "${#a4_details[@]}" -eq 0 ]]; then
+  record_assertion "A4" "Sampled partition prefixes match the deterministic seed pattern" "PASS" "${sample_artifact_dir}" "sample previews matched the deterministic seed prefixes for every sampled partition"
+else
+  record_assertion "A4" "Sampled partition prefixes match the deterministic seed pattern" "FAIL" "${sample_artifact_dir}" "$(printf '%s; ' "${a4_details[@]}" | sed 's/; $//')"
+fi
+
+corruption_pattern='CorruptRecordException|InvalidRecordException|crc|checksum|corrupt.*(log|segment|index)|Error while loading log|Found invalid messages'
+
+set +e
+write_scan_output "${recovery_log_path}" "${corruption_pattern}" "${corruption_scan_path}" "no corruption patterns detected"
+corruption_scan_status=$?
+set -e
+
+if [[ "${corruption_scan_status}" -eq 0 ]]; then
+  record_assertion "A5" "No explicit corruption or segment-recovery error in broker logs" "FAIL" "${corruption_scan_path}" "corruption patterns detected in recovery logs"
+elif [[ "${corruption_scan_status}" -eq 2 ]]; then
+  record_assertion "A5" "No explicit corruption or segment-recovery error in broker logs" "FAIL" "${corruption_scan_path}" "recovery log file missing"
+else
+  record_assertion "A5" "No explicit corruption or segment-recovery error in broker logs" "PASS" "${corruption_scan_path}" "no corruption patterns detected"
+fi
+
+summary_status="pass"
+if [[ "${had_failure}" -ne 0 ]]; then
+  summary_status="fail"
+fi
+
+jq -s \
+  --arg scenario "${scenario_id}" \
+  --arg run_id "${run_id}" \
+  --arg snapshot_label "${SNAPSHOT_LABEL}" \
+  --arg status "${summary_status}" \
+  --arg generated_at_utc "$(timestamp_utc)" \
+  '{
+    scenario: $scenario,
+    run_id: $run_id,
+    snapshot_label: $snapshot_label,
+    status: $status,
+    generated_at_utc: $generated_at_utc,
+    assertions: .
+  }' "${assertions_jsonl_path}" >"${summary_path}"
+
+log "scenario 02 assert artifacts written to ${assert_dir}"
+
+if [[ "${summary_status}" != "pass" ]]; then
+  exit 1
+fi

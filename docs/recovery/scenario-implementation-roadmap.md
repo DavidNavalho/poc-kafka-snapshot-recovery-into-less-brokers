@@ -16,6 +16,7 @@ This file is the current planning authority for:
 - The recovery harness is no longer spec-only.
 - The snapshot rewrite tool now exists behind [`bin/snapshot-rewrite-tool`](../../bin/snapshot-rewrite-tool) with implementation under [`tooling/snapshot-rewrite/`](../../tooling/snapshot-rewrite/).
 - Scenario 01 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh copied snapshot workdir.
+- Scenario 02 is now fully automated and has passed `prepare` + `rewrite` + `up` + `assert` + `report` from a fresh scenario-specific Git worktree on run `20260421T095313Z`.
 - Two important runtime issues were already found and fixed:
   - source and recovery clusters must not share the same Docker network namespace
   - copied metadata snapshot directories must be cleaned more aggressively before installing rewritten state
@@ -23,6 +24,7 @@ This file is the current planning authority for:
   - rewritten metadata logs must ship Kafka `.index` and `.timeindex` sidecars
   - recovery metadata directories must receive `leader-epoch-checkpoint` and a rewritten `quorum-state`
   - recovered partition metadata must clear ELR state instead of filtering it to surviving brokers
+- Shared harness roots now honor explicit overrides, and `prepare` stages the source metadata log into the scenario workdir so worktree-based runs do not require direct container access to snapshot files outside the mounted repo root.
 - Scenario docs may still lag reality. Until they are refreshed one by one, use this roadmap as the authoritative planning view.
 
 ## Mandatory Spec Pass Before Each Scenario
@@ -150,8 +152,9 @@ Done gate:
 
 Current status:
 
-- not automated yet
-- depends on Scenario 01 assertion/report plumbing
+- implemented and validated from a fresh worktree
+- latest clean report: `docs/recovery/reports/runs/2026-04-21-scenario-02-20260421T095313Z.md`
+- representative topic availability, offset equality, sampled reads, preview validation, and corruption-log scanning are now automated
 
 Spec before implementation:
 
@@ -160,15 +163,9 @@ Spec before implementation:
 - define clean-stop offset expectations as exact equality to the source manifest
 - define how sampled reads are captured in artifacts
 
-Likely implementation focus:
-
-- offset comparison helper against the snapshot manifest
-- deterministic sampled consumer helper
-- report output for offset comparisons and read samples
-
 Done gate:
 
-- recovered offsets match the manifest for the agreed representative scope and sample reads succeed without corruption indicators
+- achieved on 2026-04-21 by run `20260421T095313Z`
 
 ### Scenario 05: Topic And Broker Config Preservation
 
